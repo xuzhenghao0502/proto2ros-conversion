@@ -6,4 +6,5 @@
 build/
 data/
 install/
-log
+log/
+proto-interface/
