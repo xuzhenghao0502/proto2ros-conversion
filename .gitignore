@@ -1,3 +1,9 @@
 **/.mypy_cache
 **/__pycache__
 **/*.pyc
+.config
+.github
+build/
+data/
+install/
+log
