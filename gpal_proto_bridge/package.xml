@@ -24,6 +24,10 @@
   <exec_depend>rosbag2_py</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>python3-protobuf</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <!-- H.264/H.265: db2bag uses ffmpeg (bmp pipe) and optionally PyAV for stateful decode (pip install av / python3-av). -->
+  <exec_depend>ffmpeg</exec_depend>
 
   <member_of_group>rosidl_interface_packages</member_of_group>
 

@@ -6,15 +6,22 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
-import sys
 import re
+import shutil
 import sqlite3
 import struct
+import subprocess
 import sys
+from io import BytesIO
 from typing import Dict, Optional, Tuple, Type
 
+import numpy as np
 import rosbag2_py
 from ament_index_python.packages import get_package_share_directory
+from builtin_interfaces.msg import Time
+from rclpy.serialization import serialize_message
+from sensor_msgs.msg import Image, PointCloud2, PointField
+from std_msgs.msg import Header
 
 # Generated conversions.py imports e.g. `map_server.foo_pb2`; those modules live under share/.../pb2_py.
 _pb2_root = os.path.join(get_package_share_directory('gpal_proto_bridge'), 'pb2_py')
@@ -22,10 +29,21 @@ if os.path.isdir(_pb2_root) and _pb2_root not in sys.path:
     sys.path.insert(0, _pb2_root)
 from google.protobuf.descriptor_pb2 import FileDescriptorSet
 from google.protobuf.descriptor_pool import DescriptorPool
-from rclpy.serialization import serialize_message
 
 import gpal_proto_bridge.conversions as gpal_conversions
-from proto2ros.msg import Bytes as Proto2RosBytes
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+try:
+    from PIL import Image as PILImage
+except ImportError:
+    PILImage = None
+try:
+    import av
+except ImportError:
+    av = None
 
 
 def _proto_generated_class(pool: DescriptorPool, fqn: str) -> Type:
@@ -59,10 +77,412 @@ def _sanitize_topic(url: str) -> str:
     return '/ekart/' + s.lstrip('/')
 
 
-def _find_compressed_media_start(blob: bytes) -> Optional[int]:
+def _frame_id_from_url(url: str) -> str:
+    path = url.split('?', 1)[0].strip()
+    seg = path.rstrip('/').split('/')[-1]
+    return seg if seg else 'sensor'
+
+
+def _time_from_stamp_ns(stamp_ns: int) -> Time:
+    t = Time()
+    t.sec = int(stamp_ns // 1_000_000_000)
+    t.nanosec = int(stamp_ns % 1_000_000_000)
+    return t
+
+
+def _header(stamp_ns: int, frame_id: str) -> Header:
+    h = Header()
+    h.stamp = _time_from_stamp_ns(stamp_ns)
+    h.frame_id = frame_id
+    return h
+
+
+# EkaRT zerocopy lidar: ASCII field list + metadata + N × (3×float32 xyz + 2×int32); optional4-byte trailer.
+_PC_LAYOUT_MARK = b'x,y,z,intensity,timestamp_offset,ring\x00'
+
+
+def _eka_pointcloud_to_pointcloud2(blob: bytes, stamp_ns: int, frame_id: str) -> Optional[PointCloud2]:
+    idx = blob.find(_PC_LAYOUT_MARK)
+    if idx < 0:
+        print('[warn] PointCloud: missing GPAL layout marker; skip frame', file=sys.stderr)
+        return None
+    p = idx + len(_PC_LAYOUT_MARK)
+    while p < len(blob) and blob[p] == 0:
+        p += 1
+    meta_base = p
+    if meta_base + 48 > len(blob):
+        print('[warn] PointCloud: metadata truncated', file=sys.stderr)
+        return None
+    count = struct.unpack_from('<I', blob, meta_base + 24)[0]
+    data_start = meta_base + 48
+    payload_len = len(blob) - data_start
+    ok = False
+    for tail in (4, 0, 8):
+        if payload_len == count * 20 + tail:
+            ok = True
+            break
+    if not ok:
+        for tail in (4, 0, 8):
+            rem = payload_len - tail
+            if rem > 0 and rem % 20 == 0:
+                count = rem // 20
+                ok = True
+                break
+    if not ok or count <= 0:
+        print('[warn] PointCloud: size / count mismatch', file=sys.stderr)
+        return None
+    raw = blob[data_start : data_start + count * 20]
+    dt = np.dtype(
+        [
+            ('x', '<f4'),
+            ('y', '<f4'),
+            ('z', '<f4'),
+            ('_i1', '<i4'),
+            ('_i2', '<i4'),
+        ]
+    )
+    arr = np.frombuffer(raw, dtype=dt, count=count)
+    xyz = np.empty((count, 3), dtype=np.float32)
+    xyz[:, 0] = arr['x']
+    xyz[:, 1] = arr['y']
+    xyz[:, 2] = arr['z']
+
+    pc = PointCloud2()
+    pc.header = _header(stamp_ns, frame_id)
+    pc.height = 1
+    pc.width = int(count)
+    pc.is_dense = False
+    pc.is_bigendian = False
+    pc.fields = [
+        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+    ]
+    pc.point_step = 12
+    pc.row_step = 12 * int(count)
+    pc.data = xyz.astype(np.float32).tobytes()
+    return pc
+
+
+def _decode_jpeg_to_bgr(data: bytes) -> Optional[np.ndarray]:
+    if cv2 is not None:
+        arr = np.frombuffer(data, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        return bgr
+    if PILImage is not None:
+        im = PILImage.open(BytesIO(data)).convert('RGB')
+        rgb = np.asarray(im)
+        return np.ascontiguousarray(rgb[:, :, ::-1])
+    return None
+
+
+# gpal.proto.CameraFrame.Type (subset + numeric fall-through)
+_CAM_BGR_PACKED = 11
+_CAM_RGB_PACKED = 13
+_CAM_NV12 = 4
+_CAM_YUYV = 5
+_CAM_JPEG = 21
+_CAM_H264 = 22
+_CAM_H265 = 23
+
+
+def _bmp_bytes_to_bgr(buf: bytes) -> Optional[np.ndarray]:
+    if not buf:
+        return None
+    if cv2 is not None:
+        return cv2.imdecode(np.frombuffer(buf, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if PILImage is not None:
+        rgb = np.asarray(PILImage.open(BytesIO(buf)).convert('RGB'))
+        return np.ascontiguousarray(rgb[:, :, ::-1])
+    return None
+
+
+def _ffmpeg_h26x_first_frame_bgr(data: bytes, codec: str) -> Optional[np.ndarray]:
+    """Decode one access unit (Annex B) to BGR using ffmpeg → BMP pipe (stateless)."""
+    ff = shutil.which('ffmpeg')
+    if not ff or not data:
+        return None
+    fmt = 'h264' if codec == 'h264' else 'hevc'
+    cmd = [
+        ff,
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        fmt,
+        '-i',
+        'pipe:0',
+        '-frames:v',
+        '1',
+        '-f',
+        'image2pipe',
+        '-vcodec',
+        'bmp',
+        'pipe:1',
+    ]
+    try:
+        proc = subprocess.run(cmd, input=data, capture_output=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError):
+        proc = None
+    if proc and proc.returncode == 0 and proc.stdout:
+        bgr = _bmp_bytes_to_bgr(proc.stdout)
+        if bgr is not None:
+            return bgr
+    # Some devices use length-prefixed NALs; let ffmpeg probe instead of forcing raw demuxer.
+    cmd2 = [
+        ff,
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-i',
+        'pipe:0',
+        '-frames:v',
+        '1',
+        '-f',
+        'image2pipe',
+        '-vcodec',
+        'bmp',
+        'pipe:1',
+    ]
+    try:
+        proc2 = subprocess.run(cmd2, input=data, capture_output=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc2.returncode != 0 or not proc2.stdout:
+        return None
+    return _bmp_bytes_to_bgr(proc2.stdout)
+
+
+class _PyAVTopicDecoder:
+    """Stateful H.264 / HEVC decoder per topic (handles P/B frames across DB rows)."""
+
+    __slots__ = ('codec_name', '_ctx')
+
+    def __init__(self, codec_name: str) -> None:
+        if av is None:
+            raise RuntimeError('PyAV not available')
+        self.codec_name = codec_name
+        self._ctx = av.codec.CodecContext.create(codec_name, 'r')
+
+    def feed(self, data: bytes) -> Optional[np.ndarray]:
+        if not data:
+            return None
+        last: Optional[np.ndarray] = None
+        try:
+            for frame in self._ctx.decode(av.Packet(data)):
+                last = frame.to_ndarray(format='bgr24')
+        except av.AVError:
+            return last
+        return last
+
+
+def _sensor_image_from_camera_proto(
+    cam,
+    stamp_ns: int,
+    frame_id: str,
+    *,
+    topic: str,
+    h26x_decoders: Dict[str, _PyAVTopicDecoder],
+) -> Optional[Image]:
+    h, w = int(cam.height), int(cam.width)
+    typ = int(cam.type)
+    data = bytes(cam.data)
+    msg = Image()
+    msg.header = _header(stamp_ns, frame_id)
+
+    # Payload is JPEG (SOI) even when header `type` says something else (e.g. mis-tagged as H264).
+    if len(data) >= 3 and data[:3] == b'\xff\xd8\xff':
+        bgr = _decode_jpeg_to_bgr(data)
+        if bgr is None:
+            print(
+                '[warn] CameraFrame: JPEG (FF D8 FF) payload but decode failed (opencv/pillow?)',
+                file=sys.stderr,
+            )
+            return None
+        hi, wi = bgr.shape[:2]
+        msg.height, msg.width = hi, wi
+        msg.encoding = 'bgr8'
+        msg.is_bigendian = 0
+        msg.step = wi * 3
+        msg.data = bgr.tobytes()
+        return msg
+
+    if typ == _CAM_JPEG:
+        bgr = _decode_jpeg_to_bgr(data)
+        if bgr is None:
+            print('[warn] CameraFrame: JPEG decode needs python3-opencv or pillow', file=sys.stderr)
+            return None
+        hi, wi = bgr.shape[:2]
+        msg.height, msg.width = hi, wi
+        msg.encoding = 'bgr8'
+        msg.is_bigendian = 0
+        msg.step = wi * 3
+        msg.data = bgr.tobytes()
+        return msg
+
+    if typ == _CAM_BGR_PACKED:
+        if h <= 0 or w <= 0 or len(data) < h * w * 3:
+            print('[warn] CameraFrame: invalid BGR packed size', file=sys.stderr)
+            return None
+        msg.height, msg.width = h, w
+        msg.encoding = 'bgr8'
+        msg.is_bigendian = 0
+        msg.step = w * 3
+        msg.data = data[: h * w * 3]
+        return msg
+
+    if typ == _CAM_RGB_PACKED:
+        if h <= 0 or w <= 0 or len(data) < h * w * 3:
+            print('[warn] CameraFrame: invalid RGB packed size', file=sys.stderr)
+            return None
+        msg.height, msg.width = h, w
+        msg.encoding = 'rgb8'
+        msg.is_bigendian = 0
+        msg.step = w * 3
+        msg.data = data[: h * w * 3]
+        return msg
+
+    if typ in (_CAM_H264, _CAM_H265):
+        if not data:
+            print(
+                '[warn] CameraFrame: empty H264/HEVC payload (could not find JPEG / Annex B start in blob)',
+                file=sys.stderr,
+            )
+            return None
+        codec = 'h264' if typ == _CAM_H264 else 'hevc'
+        bgr: Optional[np.ndarray] = None
+        if av is not None:
+            dec = h26x_decoders.get(topic)
+            if dec is None or dec.codec_name != codec:
+                dec = _PyAVTopicDecoder(codec)
+                h26x_decoders[topic] = dec
+            bgr = dec.feed(data)
+        if bgr is None:
+            bgr = _ffmpeg_h26x_first_frame_bgr(data, codec)
+        if bgr is None:
+            print(
+                '[warn] CameraFrame: H264/H265 decode failed for '
+                f'{topic!r} (install `ffmpeg`; for P-frames also: `pip install av`)',
+                file=sys.stderr,
+            )
+            return None
+        hi, wi = bgr.shape[:2]
+        msg.height, msg.width = int(hi), int(wi)
+        msg.encoding = 'bgr8'
+        msg.is_bigendian = 0
+        msg.step = int(wi) * 3
+        msg.data = bgr.tobytes()
+        return msg
+
+    if cv2 is None:
+        print(f'[warn] CameraFrame: type {typ} needs python3-opencv; install or use JPEG/BGR/RGB only', file=sys.stderr)
+        return None
+
+    if typ == _CAM_NV12:
+        need = int(h * w * 3 / 2)
+        if len(data) < need:
+            print('[warn] CameraFrame: NV12 buffer too small', file=sys.stderr)
+            return None
+        yuv = np.frombuffer(data[:need], dtype=np.uint8).reshape((h * 3 // 2, w))
+        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+        msg.height, msg.width = h, w
+        msg.encoding = 'bgr8'
+        msg.is_bigendian = 0
+        msg.step = w * 3
+        msg.data = bgr.tobytes()
+        return msg
+
+    if typ == _CAM_YUYV:
+        need = h * w * 2
+        if len(data) < need or w % 2 != 0:
+            print('[warn] CameraFrame: YUYV buffer too small or odd width', file=sys.stderr)
+            return None
+        arr = np.frombuffer(data[:need], dtype=np.uint8).reshape((h, w // 2, 4))
+        bgr = cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_YUYV)
+        msg.height, msg.width = h, w
+        msg.encoding = 'bgr8'
+        msg.is_bigendian = 0
+        msg.step = w * 3
+        msg.data = bgr.tobytes()
+        return msg
+
+    print(f'[warn] CameraFrame: unsupported pixel type {typ} for sensor_msgs/Image', file=sys.stderr)
+    return None
+
+
+def _h264_nal_type_ok(first_nal_byte: int) -> bool:
+    """H.264: nal_unit_type = first byte & 0x1F (1..23 valid in elementary stream)."""
+    t = first_nal_byte & 0x1F
+    return 1 <= t <= 23
+
+
+def _hevc_nal_ok(b0: int, b1: int) -> bool:
+    """HEVC: 2-byte NAL header after start code; nal_unit_type = (b0 >> 1) & 0x3F."""
+    if (b0 >> 1) & 0x3F == 0:
+        return False
+    return True
+
+
+def _find_annex_b_h264(blob: bytes) -> Optional[int]:
+    n = len(blob)
+    i = 0
+    while i < n - 4:
+        if blob[i : i + 4] == b'\x00\x00\x00\x01':
+            if i + 4 < n and _h264_nal_type_ok(blob[i + 4]):
+                return i
+        if (
+            i + 3 <= n
+            and blob[i : i + 3] == b'\x00\x00\x01'
+            and (i == 0 or blob[i - 1] != 0)
+            and i + 3 < n
+            and _h264_nal_type_ok(blob[i + 3])
+        ):
+            return i
+        i += 1
+    return None
+
+
+def _find_annex_b_hevc(blob: bytes) -> Optional[int]:
+    n = len(blob)
+    i = 0
+    while i < n - 5:
+        if blob[i : i + 4] == b'\x00\x00\x00\x01':
+            if i + 5 < n and _hevc_nal_ok(blob[i + 4], blob[i + 5]):
+                return i
+        if (
+            i + 3 <= n
+            and blob[i : i + 3] == b'\x00\x00\x01'
+            and (i == 0 or blob[i - 1] != 0)
+            and i + 4 < n
+            and _hevc_nal_ok(blob[i + 3], blob[i + 4])
+        ):
+            return i
+        i += 1
+    return None
+
+
+def _find_compressed_media_start(blob: bytes, pixel_type: Optional[int] = None) -> Optional[int]:
+    """Locate first media byte: JPEG, or Annex B H.264 / HEVC (any NAL), not only SPS/PPS."""
     j = blob.find(b'\xff\xd8\xff')
     if j >= 0:
         return j
+    j = blob.find(b'\xff\xdb')
+    if j >= 0:
+        return j
+
+    if pixel_type == _CAM_H265:
+        off = _find_annex_b_hevc(blob)
+        if off is not None:
+            return off
+    if pixel_type in (None, _CAM_H264, _CAM_H265):
+        off = _find_annex_b_h264(blob)
+        if off is not None:
+            return off
+    if pixel_type in (None, _CAM_H265):
+        off = _find_annex_b_hevc(blob)
+        if off is not None:
+            return off
+
     for sig in (
         b'\x00\x00\x00\x01\x67',
         b'\x00\x00\x00\x01\x68',
@@ -72,9 +492,6 @@ def _find_compressed_media_start(blob: bytes) -> Optional[int]:
         k = blob.find(sig)
         if k >= 0:
             return k
-    j = blob.find(b'\xff\xdb')
-    if j >= 0:
-        return j
     return None
 
 
@@ -84,7 +501,7 @@ def _camera_eka_to_proto(pool: DescriptorPool, blob: bytes):
     ch, w, h, freq, typ = struct.unpack_from('<IIIII', blob, 24)
     if w > 16384 or h > 16384 or ch > 65535:
         raise ValueError('implausible camera header (width/height/channel)')
-    media_off = _find_compressed_media_start(blob)
+    media_off = _find_compressed_media_start(blob, typ)
     if media_off is None:
         media_off = len(blob)
     msg = _proto_generated_class(pool, 'gpal.proto.CameraFrame')()
@@ -173,6 +590,8 @@ def convert_db(
         'SELECT elapsed, url, data FROM EkaRT_Datas ORDER BY elapsed, rowid'
     ).fetchall()
 
+    h26x_decoders: Dict[str, _PyAVTopicDecoder] = {}
+
     for elapsed, url_id, data in rows:
         url_id = int(url_id)
         if url_id not in urls:
@@ -183,18 +602,22 @@ def convert_db(
         blob = data
 
         if ser == 'eka::rt::msg::PointCloud':
-            ensure_topic(topic, 'proto2ros/msg/Bytes')
-            ros_msg = Proto2RosBytes()
-            ros_msg.data = list(memoryview(blob))
-            writer.write(topic, serialize_message(ros_msg), ts_ns)
+            ensure_topic(topic, 'sensor_msgs/msg/PointCloud2')
+            fid = _frame_id_from_url(url)
+            pc2 = _eka_pointcloud_to_pointcloud2(blob, ts_ns, fid)
+            if pc2 is not None:
+                writer.write(topic, serialize_message(pc2), ts_ns)
             continue
 
         if ser == 'eka::rt::msg::CameraFrame':
-            ensure_topic(topic, _ros_msg_type_string(_ros_msg_class('CameraFrame')))
+            ensure_topic(topic, 'sensor_msgs/msg/Image')
             cam_proto = _camera_eka_to_proto(pool, blob)
-            ros_msg = _ros_msg_class('CameraFrame')()
-            gpal_conversions.convert(cam_proto, ros_msg)
-            writer.write(topic, serialize_message(ros_msg), ts_ns)
+            fid = _frame_id_from_url(url)
+            img = _sensor_image_from_camera_proto(
+                cam_proto, ts_ns, fid, topic=topic, h26x_decoders=h26x_decoders
+            )
+            if img is not None:
+                writer.write(topic, serialize_message(img), ts_ns)
             continue
 
         fqn = _proto_fqn_for_url_ser(ser)
