@@ -81,9 +81,13 @@ rosidl_generated_python_package_add(
   DESTINATION ${PROJECT_NAME}
 )
 
-find_program(CLANG_TIDY_EXECUTABLE NAMES "clang-tidy" REQUIRED)
-set(CXX_CLANG_TIDY "${CLANG_TIDY_EXECUTABLE}" "-header-filter=.*proto2ros.*/.*conversions.hpp")
-set_target_properties(${PROJECT_NAME}_conversions PROPERTIES CXX_CLANG_TIDY "${CXX_CLANG_TIDY}")
+find_program(CLANG_TIDY_EXECUTABLE NAMES "clang-tidy")
+if(CLANG_TIDY_EXECUTABLE)
+  set(CXX_CLANG_TIDY "${CLANG_TIDY_EXECUTABLE}" "-header-filter=.*proto2ros.*/.*conversions.hpp")
+  set_target_properties(${PROJECT_NAME}_conversions PROPERTIES CXX_CLANG_TIDY "${CXX_CLANG_TIDY}")
+else()
+  message(STATUS "clang-tidy not found; skipping CXX_CLANG_TIDY on ${PROJECT_NAME}_conversions")
+endif()
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -113,7 +117,9 @@ if(BUILD_TESTING)
     ${PROJECT_NAME}_conversions proto2ros::proto2ros_conversions
   )
   set_target_properties(regression_cpp_tests PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-  set_target_properties(regression_cpp_tests PROPERTIES CXX_CLANG_TIDY "${CXX_CLANG_TIDY}")
+  if(CLANG_TIDY_EXECUTABLE)
+    set_target_properties(regression_cpp_tests PROPERTIES CXX_CLANG_TIDY "${CXX_CLANG_TIDY}")
+  endif()
 endif()
 
 ament_package()

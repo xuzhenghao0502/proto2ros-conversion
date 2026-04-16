@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+# Copyright 2026 GPAL db bridge — converts EkaRT SQLite recordings to ROS 2 bags.
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import os
+import sys
+import re
+import sqlite3
+import struct
+import sys
+from typing import Dict, Optional, Tuple, Type
+
+import rosbag2_py
+from ament_index_python.packages import get_package_share_directory
+
+# Generated conversions.py imports e.g. `map_server.foo_pb2`; those modules live under share/.../pb2_py.
+_pb2_root = os.path.join(get_package_share_directory('gpal_proto_bridge'), 'pb2_py')
+if os.path.isdir(_pb2_root) and _pb2_root not in sys.path:
+    sys.path.insert(0, _pb2_root)
+from google.protobuf.descriptor_pb2 import FileDescriptorSet
+from google.protobuf.descriptor_pool import DescriptorPool
+from rclpy.serialization import serialize_message
+
+import gpal_proto_bridge.conversions as gpal_conversions
+from proto2ros.msg import Bytes as Proto2RosBytes
+
+
+def _proto_generated_class(pool: DescriptorPool, fqn: str) -> Type:
+    """Resolve the concrete protobuf class emitted by protoc (matches proto2ros @convert.register types)."""
+    desc = pool.FindMessageTypeByName(fqn)
+    path = desc.file.name.replace('\\', '/')
+    if not path.endswith('.proto'):
+        raise ValueError(f'unexpected proto path {path!r}')
+    module = path[:-6].replace('/', '.') + '_pb2'
+    mod = importlib.import_module(module)
+    return getattr(mod, desc.name)
+
+
+def _ros_msg_type_string(msg_cls) -> str:
+    return f'gpal_proto_bridge/msg/{msg_cls.__name__}'
+
+
+def _ros_msg_class(short_name: str):
+    mod = importlib.import_module('gpal_proto_bridge.msg')
+    return getattr(mod, short_name)
+
+
+def _short_name_from_proto_fqn(fqn: str) -> str:
+    return fqn.rsplit('.', 1)[-1]
+
+
+def _sanitize_topic(url: str) -> str:
+    s = url.replace('://', '/').replace('?', '_').replace('&', '_').replace('=', '_')
+    s = re.sub(r'[^0-9A-Za-z/_-]+', '_', s)
+    s = re.sub(r'_+', '_', s).strip('_')
+    return '/ekart/' + s.lstrip('/')
+
+
+def _find_compressed_media_start(blob: bytes) -> Optional[int]:
+    j = blob.find(b'\xff\xd8\xff')
+    if j >= 0:
+        return j
+    for sig in (
+        b'\x00\x00\x00\x01\x67',
+        b'\x00\x00\x00\x01\x68',
+        b'\x00\x00\x01\x67',
+        b'\x00\x00\x01\x68',
+    ):
+        k = blob.find(sig)
+        if k >= 0:
+            return k
+    j = blob.find(b'\xff\xdb')
+    if j >= 0:
+        return j
+    return None
+
+
+def _camera_eka_to_proto(pool: DescriptorPool, blob: bytes):
+    u0 = struct.unpack_from('<Q', blob, 0)[0]
+    ts = struct.unpack_from('<Q', blob, 8)[0]
+    ch, w, h, freq, typ = struct.unpack_from('<IIIII', blob, 24)
+    if w > 16384 or h > 16384 or ch > 65535:
+        raise ValueError('implausible camera header (width/height/channel)')
+    media_off = _find_compressed_media_start(blob)
+    if media_off is None:
+        media_off = len(blob)
+    msg = _proto_generated_class(pool, 'gpal.proto.CameraFrame')()
+    msg.header.time_meas = int(ts)
+    msg.channel = ch
+    msg.width = w
+    msg.height = h
+    msg.freq = freq
+    msg.type = typ
+    msg.data = blob[media_off:]
+    _ = u0  # layout discriminator reserved for future variants
+    return msg
+
+
+def _proto_fqn_for_url_ser(ser: str) -> Optional[str]:
+    if ser.startswith('gpal.proto.'):
+        return ser
+    if ser == 'eka::rt::msg::CameraFrame':
+        return 'gpal.proto.CameraFrame'
+    if ser == 'eka::rt::msg::PointCloud':
+        return None
+    return None
+
+
+def _load_descriptor_pool() -> DescriptorPool:
+    share = get_package_share_directory('gpal_proto_bridge')
+    desc_path = os.path.join(share, 'gpal_proto_bridge_messages_gen.desc')
+    if not os.path.isfile(desc_path):
+        raise FileNotFoundError(
+            f'Missing {desc_path}. Build and install gpal_proto_bridge, then source the workspace.'
+        )
+    with open(desc_path, 'rb') as f:
+        fds = FileDescriptorSet.FromString(f.read())
+    pool = DescriptorPool()
+    for fd in fds.file:
+        pool.Add(fd)
+    return pool
+
+
+def _row_timestamp_ns(start_timestamp_ms: int, elapsed: int) -> int:
+    # EkaRT: start_timestamp is milliseconds since epoch; elapsed is microseconds from recording start.
+    return int(start_timestamp_ms * 1_000_000 + elapsed * 1_000)
+
+
+def convert_db(
+    db_path: str,
+    bag_uri: str,
+    storage_id: str,
+    pool: DescriptorPool,
+    topic_prefix: str = '',
+) -> None:
+    conn = sqlite3.connect(db_path)
+    start_ms = conn.execute('SELECT start_timestamp FROM EkaRT_Header LIMIT 1').fetchone()[0]
+
+    urls: Dict[int, Tuple[str, str]] = {}
+    for uid, url, ser in conn.execute('SELECT id, url, ser FROM EkaRT_Urls').fetchall():
+        urls[int(uid)] = (str(url), str(ser))
+
+    writer = rosbag2_py.SequentialWriter()
+    writer.open(
+        rosbag2_py.StorageOptions(uri=bag_uri, storage_id=storage_id),
+        rosbag2_py.ConverterOptions(
+            input_serialization_format='cdr',
+            output_serialization_format='cdr',
+        ),
+    )
+
+    topics_added: Dict[str, str] = {}
+
+    def ensure_topic(topic: str, ros_type: str) -> None:
+        if topic in topics_added:
+            if topics_added[topic] != ros_type:
+                raise RuntimeError(f'Topic {topic} reused with different types')
+            return
+        topics_added[topic] = ros_type
+        writer.create_topic(
+            rosbag2_py.TopicMetadata(
+                name=topic,
+                type=ros_type,
+                serialization_format='cdr',
+                offered_qos_profiles='',
+            )
+        )
+
+    rows = conn.execute(
+        'SELECT elapsed, url, data FROM EkaRT_Datas ORDER BY elapsed, rowid'
+    ).fetchall()
+
+    for elapsed, url_id, data in rows:
+        url_id = int(url_id)
+        if url_id not in urls:
+            continue
+        url, ser = urls[url_id]
+        topic = (topic_prefix + _sanitize_topic(url)).replace('//', '/')
+        ts_ns = _row_timestamp_ns(int(start_ms), int(elapsed))
+        blob = data
+
+        if ser == 'eka::rt::msg::PointCloud':
+            ensure_topic(topic, 'proto2ros/msg/Bytes')
+            ros_msg = Proto2RosBytes()
+            ros_msg.data = list(memoryview(blob))
+            writer.write(topic, serialize_message(ros_msg), ts_ns)
+            continue
+
+        if ser == 'eka::rt::msg::CameraFrame':
+            ensure_topic(topic, _ros_msg_type_string(_ros_msg_class('CameraFrame')))
+            cam_proto = _camera_eka_to_proto(pool, blob)
+            ros_msg = _ros_msg_class('CameraFrame')()
+            gpal_conversions.convert(cam_proto, ros_msg)
+            writer.write(topic, serialize_message(ros_msg), ts_ns)
+            continue
+
+        fqn = _proto_fqn_for_url_ser(ser)
+        if not fqn:
+            print(f'[skip] Unsupported ser={ser!r} topic={topic}', file=sys.stderr)
+            continue
+
+        short = _short_name_from_proto_fqn(fqn)
+        try:
+            proto_cls = _proto_generated_class(pool, fqn)
+            ros_cls = _ros_msg_class(short)
+        except Exception as exc:  # noqa: BLE001
+            print(f'[skip] {fqn}: {exc}', file=sys.stderr)
+            continue
+
+        proto_msg = proto_cls()
+        try:
+            proto_msg.ParseFromString(blob)
+        except Exception as exc:  # noqa: BLE001
+            print(f'[skip] parse {topic} {fqn}: {exc}', file=sys.stderr)
+            continue
+
+        ensure_topic(topic, _ros_msg_type_string(ros_cls))
+        ros_msg = ros_cls()
+        gpal_conversions.convert(proto_msg, ros_msg)
+        writer.write(topic, serialize_message(ros_msg), ts_ns)
+
+    conn.close()
+    try:
+        writer.close()
+    except AttributeError:
+        pass
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description='EkaRT SQLite (.db) to ROS 2 bag (rosbag2).')
+    p.add_argument('db', help='Path to EkaRT SQLite database')
+    p.add_argument(
+        'bag',
+        help='Output bag path (directory for sqlite3 storage, or file path for mcap)',
+    )
+    p.add_argument(
+        '--storage',
+        default='sqlite3',
+        choices=('sqlite3', 'mcap'),
+        help='rosbag2 storage backend (default: sqlite3)',
+    )
+    p.add_argument(
+        '--topic-prefix',
+        default='',
+        help='Optional prefix for every topic (e.g. /vehicle1)',
+    )
+    args = p.parse_args()
+
+    pool = _load_descriptor_pool()
+    convert_db(args.db, args.bag, args.storage, pool, topic_prefix=args.topic_prefix)
+    print(f'Wrote bag at {args.bag!r} ({args.storage})')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

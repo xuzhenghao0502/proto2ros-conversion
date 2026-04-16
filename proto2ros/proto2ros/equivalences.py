@@ -12,6 +12,7 @@ respectively for further reference.
 
 import dataclasses
 import functools
+import keyword
 import math
 from collections.abc import Sequence
 from typing import Any, Iterable, List, Optional, Set, Union
@@ -287,17 +288,24 @@ def translate_field(
         else:
             type_name = f".{any_expansion}"
             field.annotations["type-casted"] = True
-    if source.syntax == "proto3":
+    # Older protoc / descriptor sets may omit `syntax`; that corresponds to proto2 semantics.
+    syntax = source.syntax or "proto2"
+    if syntax == "proto3":
         field.annotations["optional"] = descriptor.proto3_optional or (
             descriptor.label != FieldDescriptorProto.LABEL_REPEATED
             and descriptor.type == FieldDescriptorProto.TYPE_MESSAGE
         )
-    elif source.syntax == "proto2":
+    elif syntax == "proto2":
         field.annotations["optional"] = descriptor.label != FieldDescriptorProto.LABEL_REPEATED
     else:
-        raise ValueError(f"unknown proto syntax: {source.syntax}")
+        raise ValueError(f"unknown proto syntax: {syntax}")
     field.annotations["proto-cpp-name"] = descriptor.name.lower()
-    field.annotations["proto-py-name"] = descriptor.name
+    # Python protobuf appends "_" to names that are language keywords (e.g. class -> class_).
+    _py = descriptor.name
+    if keyword.iskeyword(_py):
+        _py = f"{_py}_"
+    field.annotations["proto-py-name"] = _py
+    field.annotations["proto-hasfield-name"] = descriptor.name
     ros_type_name = to_ros_base_type(field_type)
     if type_name != ".google.protobuf.Any" and ros_type_name == "proto2ros/AnyProto":
         type_name = "some"

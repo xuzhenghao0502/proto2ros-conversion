@@ -106,4 +106,8 @@ def protofqn(source: FileDescriptorProto, location: SourceCodeInfo.Location) -> 
     This type is to be found at a given `location` in a given `source` file.
     """
     name = ".".join(proto.name for proto in walk(source, location.path))
-    return f"{source.package}.{name}"
+    # Empty package must not add a leading "." — that breaks lookups keyed by
+    # google.protobuf Descriptor.full_name (e.g. synthetic closure root protos).
+    if source.package:
+        return f"{source.package}.{name}"
+    return name

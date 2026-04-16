@@ -1,0 +1,3 @@
+package_mapping:
+  gpal.proto: gpal_proto_bridge
+  gpal.proto.road_cognition: gpal_proto_bridge

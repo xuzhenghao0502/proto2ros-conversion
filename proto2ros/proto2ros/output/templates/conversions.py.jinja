@@ -283,7 +283,7 @@ def convert_{{ spec.annotations["proto-type"] | as_python_identifier  }}_proto_t
            {%- set source = "proto_msg." + field_spec.annotations.get("proto-py-name", field_spec.name) -%}
            {%- set destination = "ros_msg." + field_spec.name -%}
            {%- if field_spec.annotations["optional"] -%}{#- Check for field presence before use. #}
-    if proto_msg.HasField("{{ field_spec.annotations.get("proto-py-name", field_spec.name) }}"):
+    if proto_msg.HasField("{{ field_spec.annotations.get("proto-hasfield-name", field_spec.annotations.get("proto-py-name", field_spec.name)) }}"):
         {{ proto_to_ros_field_code(source, destination, field_spec) | indent(8) }}
         ros_msg.has_field |= {{ spec.base_type | string | as_ros_python_type }}.{{ field_spec.name | upper }}_FIELD_SET
             {%- else %}

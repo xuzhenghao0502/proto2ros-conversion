@@ -66,11 +66,15 @@ rosidl_get_typesupport_target(${PROJECT_NAME}_cpp_msgs ${PROJECT_NAME} "rosidl_t
 target_link_libraries(${PROJECT_NAME}_conversions ${${PROJECT_NAME}_cpp_msgs} protobuf::libprotobuf)
 ament_target_dependencies(${PROJECT_NAME}_conversions builtin_interfaces rclcpp std_msgs)
 
-find_program(CLANG_TIDY_EXECUTABLE NAMES "clang-tidy" REQUIRED)
-set(CXX_CLANG_TIDY "${CLANG_TIDY_EXECUTABLE}"
-  "-header-filter=.*proto2ros/.*conversions.hpp"
-  "-checks=-clang-diagnostic-ignored-optimization-argument")
-set_target_properties(${PROJECT_NAME}_conversions PROPERTIES CXX_CLANG_TIDY "${CXX_CLANG_TIDY}")
+find_program(CLANG_TIDY_EXECUTABLE NAMES "clang-tidy")
+if(CLANG_TIDY_EXECUTABLE)
+  set(CXX_CLANG_TIDY "${CLANG_TIDY_EXECUTABLE}"
+    "-header-filter=.*proto2ros/.*conversions.hpp"
+    "-checks=-clang-diagnostic-ignored-optimization-argument")
+  set_target_properties(${PROJECT_NAME}_conversions PROPERTIES CXX_CLANG_TIDY "${CXX_CLANG_TIDY}")
+else()
+  message(STATUS "clang-tidy not found; skipping CXX_CLANG_TIDY on ${PROJECT_NAME}_conversions")
+endif()
 
 include(cmake/rosidl_helpers.cmake)
 rosidl_generated_python_package_add(
