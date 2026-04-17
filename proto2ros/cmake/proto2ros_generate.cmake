@@ -129,6 +129,21 @@ function(proto2ros_generate target)
   # configuration time.
   get_executable_path(PYTHON_EXECUTABLE Python3::Interpreter CONFIGURE)
   execute_process(
+    COMMAND "${PYTHON_EXECUTABLE}" -c "import google.protobuf.descriptor_pb2"
+    RESULT_VARIABLE _proto2ros_have_google_protobuf
+    ERROR_VARIABLE _proto2ros_google_protobuf_err
+    OUTPUT_QUIET
+  )
+  if(NOT _proto2ros_have_google_protobuf EQUAL 0)
+    message(
+      FATAL_ERROR
+      "proto2ros_generate: Python module 'google.protobuf' is missing (needed by proto2ros.cli.generate).\n"
+      "  Python interpreter: ${PYTHON_EXECUTABLE}\n"
+      "  On Debian/Ubuntu: sudo apt install python3-protobuf\n"
+      "  Or: \"${PYTHON_EXECUTABLE}\" -m pip install protobuf\n"
+      "  Import check stderr: ${_proto2ros_google_protobuf_err}")
+  endif()
+  execute_process(
     COMMAND
       ${CMAKE_COMMAND} -E env
         "PYTHONPATH=${APPEND_PYTHONPATH}:$ENV{PYTHONPATH}"

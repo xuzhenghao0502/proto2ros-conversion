@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+# Copyright 2026 GPAL — rosbag2 helper: count Image messages and preview the middle frame.
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+import cv2
+import rclpy
+import rosbag2_py
+from cv_bridge import CvBridge
+from rclpy.serialization import deserialize_message
+from sensor_msgs.msg import Image
+
+
+def normalize_topic(topic: str) -> str:
+    t = topic.strip()
+    if not t.startswith('/'):
+        t = '/' + t
+    return t
+
+
+def open_reader(bag_uri: str, storage_id: str) -> rosbag2_py.SequentialReader:
+    reader = rosbag2_py.SequentialReader()
+    reader.open(
+        rosbag2_py.StorageOptions(uri=bag_uri, storage_id=storage_id),
+        rosbag2_py.ConverterOptions(
+            input_serialization_format='cdr',
+            output_serialization_format='cdr',
+        ),
+    )
+    return reader
+
+
+def topic_info_from_metadata(
+    reader: rosbag2_py.SequentialReader, topic: str
+) -> tuple[int | None, str | None]:
+    """Return (message_count, ros_type) from bag metadata, or (None, None) if topic not listed."""
+    meta = reader.get_metadata()
+    for tic in meta.topics_with_message_count:
+        tm = tic.topic_metadata
+        if normalize_topic(tm.name) == topic:
+            return tic.message_count, tm.type
+    return None, None
+
+
+def count_topic_messages(bag_uri: str, storage_id: str, topic: str) -> int:
+    reader = open_reader(bag_uri, storage_id)
+    n = 0
+    while reader.has_next():
+        tname, _, _ = reader.read_next()
+        if normalize_topic(tname) == topic:
+            n += 1
+    return n
+
+
+def read_image_at_index(
+    bag_uri: str, storage_id: str, topic: str, index_0based: int
+) -> Image:
+    reader = open_reader(bag_uri, storage_id)
+    seen = 0
+    while reader.has_next():
+        tname, data, _ts = reader.read_next()
+        if normalize_topic(tname) != topic:
+            continue
+        if seen == index_0based:
+            return deserialize_message(data, Image)
+        seen += 1
+    raise RuntimeError(
+        f'bag ended before reaching message index {index_0based} on {topic} (saw {seen} messages)'
+    )
+
+
+def format_topic_list(reader: rosbag2_py.SequentialReader) -> str:
+    meta = reader.get_metadata()
+    names = sorted(
+        {normalize_topic(tic.topic_metadata.name) for tic in meta.topics_with_message_count}
+    )
+    return '\n'.join(names) if names else '(no topics in metadata)'
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Read a rosbag2 bag, count sensor_msgs/Image messages on a topic, '
+            'and show the middle frame (1-based frame index = n // 2, same as 100 frames → frame 50).'
+        )
+    )
+    parser.add_argument(
+        'bag',
+        help='Path to rosbag2 directory (folder containing metadata.yaml) or storage URI',
+    )
+    parser.add_argument('topic', help='Topic name, e.g. /camera/image_raw')
+    parser.add_argument(
+        '--storage-id',
+        default='',
+        help='rosbag2 storage plugin id (default: empty for automatic)',
+    )
+    parser.add_argument(
+        '--max-width',
+        type=int,
+        default=720,
+        help='Scale preview so width is at most this many pixels (0 = native size)',
+    )
+    args = parser.parse_args()
+
+    topic = normalize_topic(args.topic)
+    rclpy.init(args=sys.argv)
+    try:
+        probe = open_reader(args.bag, args.storage_id)
+        n_meta, decl_type = topic_info_from_metadata(probe, topic)
+
+        if decl_type is not None and decl_type != 'sensor_msgs/msg/Image':
+            print(
+                f'error: topic {topic} has type {decl_type!r}, expected sensor_msgs/msg/Image',
+                file=sys.stderr,
+            )
+            return 2
+
+        if n_meta is not None:
+            n = n_meta
+        else:
+            print(
+                f'warning: topic {topic} not in bag metadata; counting by scanning the bag…',
+                file=sys.stderr,
+            )
+            n = count_topic_messages(args.bag, args.storage_id, topic)
+
+        if n == 0:
+            print(f'Topic {topic}: 0 messages.')
+            print('Topics in bag:', file=sys.stderr)
+            print(format_topic_list(probe), file=sys.stderr)
+            return 1
+
+        # 向下取整: e.g. 100 frames → 第 50 帧 → 0-based index 49
+        mid_1based = max(1, n // 2)
+        mid_0based = mid_1based - 1
+
+        print(f'Topic {topic}: {n} messages')
+        print(f'Middle preview: 1-based frame {mid_1based} (0-based index {mid_0based}).')
+
+        try:
+            img_msg = read_image_at_index(args.bag, args.storage_id, topic, mid_0based)
+        except Exception as exc:
+            print(f'error: failed to deserialize image: {exc}', file=sys.stderr)
+            return 3
+
+        bridge = CvBridge()
+        try:
+            cv_img = bridge.imgmsg_to_cv2(img_msg, desired_encoding='bgr8')
+        except Exception as exc:
+            print(f'error: cv_bridge could not convert Image: {exc}', file=sys.stderr)
+            return 3
+
+        if args.max_width > 0:
+            h, w = cv_img.shape[:2]
+            if w > args.max_width:
+                scale = args.max_width / w
+                cv_img = cv2.resize(
+                    cv_img,
+                    (int(w * scale), int(h * scale)),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+        win = f'Middle frame {mid_1based}/{n} — {topic}'
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.imshow(win, cv_img)
+        print('Close the image window or press any key in it to exit.')
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        return 0
+    finally:
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -150,6 +150,8 @@ install(DIRECTORY "${PROTO_PYTHON_OUT}/" DESTINATION share/${PROJECT_NAME}/pb2_p
 
 install(PROGRAMS
   scripts/db2bag
+  scripts/bag_image_midframe
+  scripts/db_peek_camera_frame
   DESTINATION lib/${PROJECT_NAME}
 )
 

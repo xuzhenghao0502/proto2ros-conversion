@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+# Copyright 2026 GPAL — peek one EkaRT SQLite CameraFrame row (JPEG or H.264/H.265) and show or save as image.
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import sqlite3
+import struct
+import subprocess
+import sys
+from io import BytesIO
+from typing import Any, Optional, Tuple
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+try:
+    from PIL import Image as PILImage
+except ImportError:
+    PILImage = None
+try:
+    import av
+except ImportError:
+    av = None
+
+# PyAV 10+ uses av.error.FFmpegError (InvalidDataError, etc.); older builds had av.AVError.
+if av is not None:
+    try:
+        from av.error import FFmpegError as _PyAVCodecError
+    except ImportError:
+        _PyAVCodecError = getattr(av, 'AVError', OSError)
+else:
+    _PyAVCodecError = OSError  # unused when av is None
+
+_np = None
+
+
+def _numpy():
+    global _np
+    if _np is None:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise SystemExit(
+                'python3-numpy is required (same as db2bag). Install numpy or use your ROS environment.'
+            ) from exc
+        _np = np
+    return _np
+
+
+# gpal.proto.CameraFrame.Type (subset; matches db2bag)
+_CAM_JPEG = 21
+_CAM_H264 = 22
+_CAM_H265 = 23
+
+
+def _sanitize_topic(url: str) -> str:
+    s = url.replace('://', '/').replace('?', '_').replace('&', '_').replace('=', '_')
+    s = re.sub(r'[^0-9A-Za-z/_-]+', '_', s)
+    s = re.sub(r'_+', '_', s).strip('_')
+    return '/ekart/' + s.lstrip('/')
+
+
+def _h264_nal_type_ok(first_nal_byte: int) -> bool:
+    t = first_nal_byte & 0x1F
+    return 1 <= t <= 23
+
+
+def _hevc_nal_ok(b0: int, b1: int) -> bool:
+    if (b0 >> 1) & 0x3F == 0:
+        return False
+    return True
+
+
+def _find_annex_b_h264(blob: bytes) -> Optional[int]:
+    n = len(blob)
+    i = 0
+    while i < n - 4:
+        if blob[i : i + 4] == b'\x00\x00\x00\x01':
+            if i + 4 < n and _h264_nal_type_ok(blob[i + 4]):
+                return i
+        if (
+            i + 3 <= n
+            and blob[i : i + 3] == b'\x00\x00\x01'
+            and (i == 0 or blob[i - 1] != 0)
+            and i + 3 < n
+            and _h264_nal_type_ok(blob[i + 3])
+        ):
+            return i
+        i += 1
+    return None
+
+
+def _find_annex_b_hevc(blob: bytes) -> Optional[int]:
+    n = len(blob)
+    i = 0
+    while i < n - 5:
+        if blob[i : i + 4] == b'\x00\x00\x00\x01':
+            if i + 5 < n and _hevc_nal_ok(blob[i + 4], blob[i + 5]):
+                return i
+        if (
+            i + 3 <= n
+            and blob[i : i + 3] == b'\x00\x00\x01'
+            and (i == 0 or blob[i - 1] != 0)
+            and i + 4 < n
+            and _hevc_nal_ok(blob[i + 3], blob[i + 4])
+        ):
+            return i
+        i += 1
+    return None
+
+
+def _find_compressed_media_start(blob: bytes, pixel_type: Optional[int] = None) -> Optional[int]:
+    j = blob.find(b'\xff\xd8\xff')
+    if j >= 0:
+        return j
+    j = blob.find(b'\xff\xdb')
+    if j >= 0:
+        return j
+
+    if pixel_type == _CAM_H265:
+        off = _find_annex_b_hevc(blob)
+        if off is not None:
+            return off
+    if pixel_type in (None, _CAM_H264, _CAM_H265):
+        off = _find_annex_b_h264(blob)
+        if off is not None:
+            return off
+    if pixel_type in (None, _CAM_H265):
+        off = _find_annex_b_hevc(blob)
+        if off is not None:
+            return off
+
+    for sig in (
+        b'\x00\x00\x00\x01\x67',
+        b'\x00\x00\x00\x01\x68',
+        b'\x00\x00\x01\x67',
+        b'\x00\x00\x01\x68',
+    ):
+        k = blob.find(sig)
+        if k >= 0:
+            return k
+    return None
+
+
+def _decode_jpeg_to_bgr(data: bytes) -> Optional[Any]:
+    np = _numpy()
+    if cv2 is not None:
+        arr = np.frombuffer(data, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if PILImage is not None:
+        im = PILImage.open(BytesIO(data)).convert('RGB')
+        rgb = np.asarray(im)
+        return np.ascontiguousarray(rgb[:, :, ::-1])
+    return None
+
+
+def _bmp_bytes_to_bgr(buf: bytes) -> Optional[Any]:
+    if not buf:
+        return None
+    np = _numpy()
+    if cv2 is not None:
+        return cv2.imdecode(np.frombuffer(buf, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if PILImage is not None:
+        rgb = np.asarray(PILImage.open(BytesIO(buf)).convert('RGB'))
+        return np.ascontiguousarray(rgb[:, :, ::-1])
+    return None
+
+
+def _ffmpeg_h26x_first_frame_bgr(data: bytes, codec: str) -> Optional[Any]:
+    ff = shutil.which('ffmpeg')
+    if not ff or not data:
+        return None
+    fmt = 'h264' if codec == 'h264' else 'hevc'
+    cmd = [
+        ff,
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        fmt,
+        '-i',
+        'pipe:0',
+        '-frames:v',
+        '1',
+        '-f',
+        'image2pipe',
+        '-vcodec',
+        'bmp',
+        'pipe:1',
+    ]
+    try:
+        proc = subprocess.run(cmd, input=data, capture_output=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError):
+        proc = None
+    if proc and proc.returncode == 0 and proc.stdout:
+        bgr = _bmp_bytes_to_bgr(proc.stdout)
+        if bgr is not None:
+            return bgr
+    cmd2 = [
+        ff,
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-i',
+        'pipe:0',
+        '-frames:v',
+        '1',
+        '-f',
+        'image2pipe',
+        '-vcodec',
+        'bmp',
+        'pipe:1',
+    ]
+    try:
+        proc2 = subprocess.run(cmd2, input=data, capture_output=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc2.returncode != 0 or not proc2.stdout:
+        return None
+    return _bmp_bytes_to_bgr(proc2.stdout)
+
+
+def _pyav_first_frame_bgr(data: bytes, codec_name: str) -> Optional[Any]:
+    if av is None:
+        return None
+    ctx = av.codec.CodecContext.create(codec_name, 'r')
+    try:
+        for frame in ctx.decode(av.Packet(data)):
+            return frame.to_ndarray(format='bgr24')
+    except _PyAVCodecError:
+        return None
+    return None
+
+
+def _pyav_feed_sequence_last_bgr(codec_name: str, packets: list[bytes]) -> Optional[Any]:
+    """One decoder context, feed access units in order (matches db2bag _PyAVTopicDecoder). Required for P/B slices."""
+    if av is None or not packets:
+        return None
+    ctx = av.codec.CodecContext.create(codec_name, 'r')
+    last: Optional[Any] = None
+    for data in packets:
+        if not data:
+            continue
+        try:
+            for frame in ctx.decode(av.Packet(data)):
+                last = frame.to_ndarray(format='bgr24')
+        except _PyAVCodecError:
+            # Same idea as db2bag feed(): bad AU / send_packet failure — keep going with later packets.
+            continue
+    try:
+        for frame in ctx.decode(None):
+            last = frame.to_ndarray(format='bgr24')
+    except _PyAVCodecError:
+        pass
+    return last
+
+
+def _parse_ekart_camera_blob(blob: bytes) -> Tuple[dict, bytes]:
+    if len(blob) < 44:
+        raise ValueError('camera blob too short')
+    u0 = struct.unpack_from('<Q', blob, 0)[0]
+    ts = struct.unpack_from('<Q', blob, 8)[0]
+    ch, w, h, freq, typ = struct.unpack_from('<IIIII', blob, 24)
+    if w > 16384 or h > 16384 or ch > 65535:
+        raise ValueError('implausible camera header (width/height/channel)')
+    media_off = _find_compressed_media_start(blob, typ)
+    if media_off is None:
+        media_off = len(blob)
+    meta = {
+        'u0': u0,
+        'time_meas_ns': int(ts),
+        'channel': int(ch),
+        'width': int(w),
+        'height': int(h),
+        'freq': int(freq),
+        'type': int(typ),
+        'media_offset': int(media_off),
+    }
+    return meta, blob[media_off:]
+
+
+def _decode_payload_to_bgr(payload: bytes, typ: int) -> Tuple[Optional[Any], str]:
+    """Return (bgr image or None, label for how decoded). Single packet only (JPEG / lone IDR)."""
+    if len(payload) >= 3 and payload[:3] == b'\xff\xd8\xff':
+        bgr = _decode_jpeg_to_bgr(payload)
+        return bgr, 'jpeg_soi'
+
+    if typ == _CAM_JPEG:
+        bgr = _decode_jpeg_to_bgr(payload)
+        return bgr, 'jpeg_type'
+
+    if typ in (_CAM_H264, _CAM_H265):
+        codec = 'h264' if typ == _CAM_H264 else 'hevc'
+        av_name = 'h264' if typ == _CAM_H264 else 'hevc'
+        bgr = _pyav_first_frame_bgr(payload, av_name)
+        if bgr is not None:
+            return bgr, f'{codec}_pyav_packet'
+        bgr = _ffmpeg_h26x_first_frame_bgr(payload, codec)
+        if bgr is not None:
+            return bgr, f'{codec}_ffmpeg_packet'
+        return None, f'{codec}_failed_packet'
+
+    return None, f'unsupported_type_{typ}'
+
+
+def _decode_h26x_sequence_last_bgr(payloads: list[bytes], typ: int) -> Tuple[Optional[Any], str]:
+    """Decode H.264/H.265 by feeding packets1..N in order; return last displayed frame."""
+    if typ not in (_CAM_H264, _CAM_H265):
+        return None, 'not_h26x'
+    codec = 'h264' if typ == _CAM_H264 else 'hevc'
+    av_name = 'h264' if typ == _CAM_H264 else 'hevc'
+    bgr = _pyav_feed_sequence_last_bgr(av_name, payloads)
+    if bgr is not None:
+        return bgr, f'{codec}_pyav_seq({len(payloads)}pkts)'
+    joined = b''.join(payloads)
+    bgr = _ffmpeg_h26x_first_frame_bgr(joined, codec)
+    if bgr is not None:
+        return bgr, f'{codec}_ffmpeg_concat'
+    return None, f'{codec}_failed_seq'
+
+
+def _resolve_url_id(conn: sqlite3.Connection, topic: str) -> int:
+    want = topic.rstrip('/').replace('//', '/')
+    for uid, url, ser in conn.execute('SELECT id, url, ser FROM EkaRT_Urls').fetchall():
+        if str(ser) != 'eka::rt::msg::CameraFrame':
+            continue
+        if _sanitize_topic(str(url)) == want:
+            return int(uid)
+    raise SystemExit(f'No eka::rt::msg::CameraFrame URL maps to topic {want!r} (see EkaRT_Urls).')
+
+
+def _list_channels(conn: sqlite3.Connection) -> None:
+    """Print every recorder URL with the same ROS topic name db2bag would use."""
+    data_counts: dict[int, int] = {}
+    for url_id, n in conn.execute('SELECT url, COUNT(*) FROM EkaRT_Datas GROUP BY url').fetchall():
+        data_counts[int(url_id)] = int(n)
+
+    rows = conn.execute(
+        'SELECT id, url, type, ser, count, loss, size, freq FROM EkaRT_Urls ORDER BY id'
+    ).fetchall()
+
+    headers = (
+        'id',
+        'topic',
+        'url',
+        'ser',
+        'type',
+        'count',
+        'freq',
+        'data_rows',
+    )
+    print('\t'.join(headers))
+    for rid, url, typ, ser, count, loss, size, freq in rows:
+        uid = int(rid)
+        topic = _sanitize_topic(str(url))
+        line = [
+            str(uid),
+            topic,
+            str(url),
+            str(ser),
+            '' if typ is None else str(typ),
+            '' if count is None else str(count),
+            '' if freq is None else str(freq),
+            str(data_counts.get(uid, 0)),
+        ]
+        print('\t'.join(line))
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=(
+            'Read one EkaRT DB CameraFrame by ROS-style topic name and show/save decoded image, '
+            'or list all recorder channels (--list).'
+        )
+    )
+    p.add_argument(
+        'db',
+        nargs='?',
+        default='data/C2_0328.db',
+        help='Path to EkaRT SQLite database (default: data/C2_0328.db)',
+    )
+    p.add_argument(
+        '--topic',
+        default='/ekart/shm/hal/compressed/cam_fcf_depth_5',
+        help='Topic as produced by db2bag sanitization (default: depth-5 compressed cam_fcf)',
+    )
+    p.add_argument(
+        '--frame',
+        type=int,
+        default=10,
+        help='1-based frame index for this URL (ORDER BY elapsed, rowid)',
+    )
+    p.add_argument('-o', '--output', help='Write BGR image as PNG (recommended if no display)')
+    p.add_argument(
+        '--list',
+        '-l',
+        action='store_true',
+        help='List all channels: url id, raw url, ROS topic (db2bag naming), ser, and EkaRT_Datas row counts',
+    )
+    args = p.parse_args()
+
+    db_path = os.path.abspath(args.db)
+    if not os.path.isfile(db_path):
+        print(f'Missing database: {db_path}', file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(db_path)
+    if args.list:
+        _list_channels(conn)
+        conn.close()
+        return 0
+
+    if args.frame < 1:
+        print('--frame must be >= 1', file=sys.stderr)
+        conn.close()
+        return 2
+
+    url_id = _resolve_url_id(conn, args.topic)
+    row = conn.execute(
+        'SELECT elapsed, data FROM EkaRT_Datas WHERE url = ? ORDER BY elapsed, rowid LIMIT 1 OFFSET ?',
+        (url_id, args.frame - 1),
+    ).fetchone()
+
+    if row is None:
+        conn.close()
+        print(f'No row at frame {args.frame} for url id {url_id}', file=sys.stderr)
+        return 1
+
+    elapsed, blob = row
+    meta, payload = _parse_ekart_camera_blob(blob)
+
+    if meta['type'] in (_CAM_H264, _CAM_H265):
+        prefix_rows = conn.execute(
+            'SELECT data FROM EkaRT_Datas WHERE url = ? ORDER BY elapsed, rowid LIMIT ?',
+            (url_id, args.frame),
+        ).fetchall()
+        conn.close()
+        payloads = [_parse_ekart_camera_blob(b[0])[1] for b in prefix_rows]
+        bgr, how = _decode_h26x_sequence_last_bgr(payloads, meta['type'])
+        seq_n = len(payloads)
+    else:
+        conn.close()
+        bgr, how = _decode_payload_to_bgr(payload, meta['type'])
+        seq_n = 1
+
+    print(
+        f'frame={args.frame} url_id={url_id} elapsed_us={elapsed} '
+        f'header WxH={meta["width"]}x{meta["height"]} type={meta["type"]} '
+        f'media_off={meta["media_offset"]} last_payload_len={len(payload)} '
+        f'seq_packets={seq_n} decode={how}'
+    )
+
+    if bgr is None:
+        print(
+            'Decode failed. JPEG: install python3-opencv or pillow. '
+            'H.264/H.265: P/B frames need PyAV stateful decode — run `pip install av` '
+            '(and ensure ffmpeg is installed for rare fallbacks).',
+            file=sys.stderr,
+        )
+        return 1
+
+    out_path = args.output
+    if out_path:
+        if cv2 is None:
+            print('OpenCV required for PNG output (-o)', file=sys.stderr)
+            return 1
+        cv2.imwrite(out_path, bgr)
+        print(f'Wrote {out_path}')
+        return 0
+
+    if cv2 is None:
+        print('OpenCV required for display; use -o out.png', file=sys.stderr)
+        return 1
+
+    if not os.environ.get('DISPLAY'):
+        fallback = os.path.abspath('peek_camera_frame.png')
+        cv2.imwrite(fallback, bgr)
+        print(f'No DISPLAY; wrote {fallback}')
+        return 0
+
+    cv2.imshow(f'{args.topic} frame {args.frame}', bgr)
+    print('Press any key in the image window to exit.')
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
