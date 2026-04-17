@@ -23,6 +23,8 @@ Copyright (c) 2023 Robotics and AI Institute LLC dba RAI Institute. All rights r
   <build_depend>python3-jinja2</build_depend>
   <build_depend>python3-multipledispatch</build_depend>
   <build_depend>python3-networkx</build_depend>
+  <!-- Debian/Ubuntu networkx imports generators that load SciPy; declare so rosdep keeps NumPy/SciPy matched -->
+  <build_depend>python3-scipy</build_depend>
   <build_depend>python3-numpy</build_depend>
   <build_depend>python3-protobuf</build_depend>
   <build_export_depend>python3-protobuf</build_export_depend>
@@ -46,6 +48,7 @@ Copyright (c) 2023 Robotics and AI Institute LLC dba RAI Institute. All rights r
   <exec_depend>python3-multipledispatch</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-networkx</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
   <exec_depend>python3-protobuf</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
 

@@ -376,7 +376,11 @@ def main() -> int:
         description=(
             'Read one EkaRT DB CameraFrame by ROS-style topic name and show/save decoded image, '
             'or list all recorder channels (--list).'
-        )
+        ),
+        epilog=(
+            'To export a full topic to a new rosbag as sensor_msgs/Image (bgr8), use: '
+            'db2bag DB OUT_BAG --only-topic /ekart/... (repeat --only-topic for multiple).'
+        ),
     )
     p.add_argument(
         'db',

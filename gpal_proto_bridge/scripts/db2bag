@@ -13,7 +13,7 @@ import struct
 import subprocess
 import sys
 from io import BytesIO
-from typing import Dict, Optional, Tuple, Type
+from typing import Dict, FrozenSet, Optional, Tuple, Type
 
 import numpy as np
 import rosbag2_py
@@ -27,8 +27,19 @@ from std_msgs.msg import Header
 _pb2_root = os.path.join(get_package_share_directory('gpal_proto_bridge'), 'pb2_py')
 if os.path.isdir(_pb2_root) and _pb2_root not in sys.path:
     sys.path.insert(0, _pb2_root)
-from google.protobuf.descriptor_pb2 import FileDescriptorSet
-from google.protobuf.descriptor_pool import DescriptorPool
+try:
+    from google.protobuf.descriptor_pb2 import FileDescriptorSet
+    from google.protobuf.descriptor_pool import DescriptorPool
+except ModuleNotFoundError as exc:
+    missing = getattr(exc, 'name', None) or ''
+    if not (missing == 'google' or missing.startswith('google.')):
+        raise
+    raise SystemExit(
+        'db2bag needs the Python protobuf module (import google.protobuf).\n'
+        'Fix: sudo apt install python3-protobuf   or   pip install protobuf\n'
+        'Prefer: source install/setup.bash && ros2 run gpal_proto_bridge db2bag ...\n'
+        'so the same environment as rclpy is used (see package.xml exec_depend python3-protobuf).'
+    ) from exc
 
 import gpal_proto_bridge.conversions as gpal_conversions
 
@@ -75,6 +86,14 @@ def _sanitize_topic(url: str) -> str:
     s = re.sub(r'[^0-9A-Za-z/_-]+', '_', s)
     s = re.sub(r'_+', '_', s).strip('_')
     return '/ekart/' + s.lstrip('/')
+
+
+def _normalize_topic_key(name: str) -> str:
+    """Canonical form for comparing user --only-topic with sanitized recorder topics."""
+    s = name.strip().replace('//', '/')
+    if not s.startswith('/'):
+        s = '/' + s
+    return s.rstrip('/') or '/'
 
 
 def _frame_id_from_url(url: str) -> str:
@@ -552,6 +571,7 @@ def convert_db(
     storage_id: str,
     pool: DescriptorPool,
     topic_prefix: str = '',
+    only_topics: Optional[FrozenSet[str]] = None,
 ) -> None:
     conn = sqlite3.connect(db_path)
     start_ms = conn.execute('SELECT start_timestamp FROM EkaRT_Header LIMIT 1').fetchone()[0]
@@ -598,6 +618,8 @@ def convert_db(
             continue
         url, ser = urls[url_id]
         topic = (topic_prefix + _sanitize_topic(url)).replace('//', '/')
+        if only_topics is not None and _normalize_topic_key(topic) not in only_topics:
+            continue
         ts_ns = _row_timestamp_ns(int(start_ms), int(elapsed))
         blob = data
 
@@ -670,10 +692,32 @@ def main() -> int:
         default='',
         help='Optional prefix for every topic (e.g. /vehicle1)',
     )
+    p.add_argument(
+        '--only-topic',
+        action='append',
+        dest='only_topics',
+        metavar='TOPIC',
+        help=(
+            'Only write messages for this ROS topic (repeat flag for several). '
+            'Names must match db2bag output, e.g. /ekart/shm/hal/compressed/cam_fcf_depth_5. '
+            'CameraFrame rows become sensor_msgs/msg/Image (bgr8) with timestamps from the DB.'
+        ),
+    )
     args = p.parse_args()
 
+    only_set: Optional[FrozenSet[str]] = None
+    if args.only_topics:
+        only_set = frozenset(_normalize_topic_key(t) for t in args.only_topics)
+
     pool = _load_descriptor_pool()
-    convert_db(args.db, args.bag, args.storage, pool, topic_prefix=args.topic_prefix)
+    convert_db(
+        args.db,
+        args.bag,
+        args.storage,
+        pool,
+        topic_prefix=args.topic_prefix,
+        only_topics=only_set,
+    )
     print(f'Wrote bag at {args.bag!r} ({args.storage})')
     return 0
 
