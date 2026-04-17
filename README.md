@@ -104,6 +104,15 @@ python3 -m pip install jinja2 inflection multipledispatch networkx numpy scipy p
 **`ModuleNotFoundError: No module named 'jinja2' / 'inflection' / …`**  
 说明 **「构建与环境依赖（Python）」** 一节中的包尚未装入当前 `python3`。优先执行该节的 **`apt install`** 或 **`pip install`** 整表命令，然后重新 `colcon build`。
 
+**`TypeError: Descriptors cannot be created directly`**（在导入 `*_pb2.py` / `gpal_proto_bridge.conversions` 时）说明当前 **`google.protobuf`（多为 pip 的 4.x/5.x）** 与 **构建时 `protoc` 生成的旧式 Python `_pb2` 代码** 不兼容。
+
+处理方式（任选其一）：
+
+- **`db2bag` 已默认**在进程内设置 `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python`（较慢但通常可直接运行）。更新到含此改动的安装后执行 `ros2 run ... db2bag`。
+- 或在运行前手动：`export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python`
+- 或 **降级 protobuf**：`python3 -m pip install 'protobuf>=3.20,<4'`
+- 长期：用 **较新的 `protoc`（≥ 3.19）** 重新生成 `pb2_py` 后 `colcon build`（与当前 pip protobuf 对齐）。
+
 ## 后续步骤
 
 请参阅 [贡献指南](CONTRIBUTING.md)。

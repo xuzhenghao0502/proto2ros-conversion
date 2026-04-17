@@ -3,9 +3,15 @@
 
 from __future__ import annotations
 
+import os
+
+# Installed *_pb2.py may be legacy protoc output; protobuf 4+/5+ default implementation
+# rejects direct Descriptor construction. Pure-Python backend stays compatible.
+# https://protobuf.dev/news/2022-05-06/#python-updates
+os.environ.setdefault('PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION', 'python')
+
 import argparse
 import importlib
-import os
 import re
 import shutil
 import sqlite3
@@ -55,6 +61,15 @@ try:
     import av
 except ImportError:
     av = None
+
+# PyAV 10+ uses av.error.FFmpegError; older wheels exposed av.AVError.
+if av is not None:
+    try:
+        from av.error import FFmpegError as _PyAVCodecError
+    except ImportError:
+        _PyAVCodecError = getattr(av, 'AVError', OSError)
+else:
+    _PyAVCodecError = OSError
 
 
 def _proto_generated_class(pool: DescriptorPool, fqn: str) -> Type:
@@ -290,7 +305,7 @@ class _PyAVTopicDecoder:
         try:
             for frame in self._ctx.decode(av.Packet(data)):
                 last = frame.to_ndarray(format='bgr24')
-        except av.AVError:
+        except _PyAVCodecError:
             return last
         return last
 
