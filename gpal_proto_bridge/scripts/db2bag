@@ -560,6 +560,46 @@ def _proto_fqn_for_url_ser(ser: str) -> Optional[str]:
     return None
 
 
+def _load_db2bag_topic_config(path: str) -> Dict[str, Tuple[str, str]]:
+    """Load ``topic`` / ``eka_type`` / ``ros_type`` entries; keys are normalized topic names."""
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            'db2bag --config needs PyYAML.\n'
+            'Fix: sudo apt install python3-yaml   or   pip install pyyaml\n'
+            '(see gpal_proto_bridge package.xml exec_depend python3-yaml).'
+        ) from exc
+
+    with open(path, encoding='utf-8') as f:
+        doc = yaml.safe_load(f)
+    topics = doc.get('topics') if isinstance(doc, dict) else None
+    if not isinstance(topics, list):
+        raise SystemExit(f'{path}: expected a mapping with key "topics" whose value is a list')
+
+    out: Dict[str, Tuple[str, str]] = {}
+    for i, item in enumerate(topics):
+        if not isinstance(item, dict):
+            raise SystemExit(f'{path}: topics[{i}] must be a mapping')
+        t = item.get('topic')
+        ek = item.get('eka_type')
+        rt = item.get('ros_type')
+        if not isinstance(t, str) or not isinstance(ek, str) or not isinstance(rt, str):
+            raise SystemExit(
+                f'{path}: topics[{i}] needs string fields topic, eka_type, ros_type'
+            )
+        nt = _normalize_topic_key(t)
+        if nt in out:
+            raise SystemExit(f'{path}: duplicate topic {t!r}')
+        ros_type = rt.strip()
+        if '/' not in ros_type:
+            raise SystemExit(
+                f'{path}: topics[{i}] ros_type must look like pkg/msg/Name, got {ros_type!r}'
+            )
+        out[nt] = (ek.strip(), ros_type)
+    return out
+
+
 def _load_descriptor_pool() -> DescriptorPool:
     share = get_package_share_directory('gpal_proto_bridge')
     desc_path = os.path.join(share, 'gpal_proto_bridge_messages_gen.desc')
@@ -587,6 +627,7 @@ def convert_db(
     pool: DescriptorPool,
     topic_prefix: str = '',
     only_topics: Optional[FrozenSet[str]] = None,
+    topic_specs: Optional[Dict[str, Tuple[str, str]]] = None,
 ) -> None:
     conn = sqlite3.connect(db_path)
     start_ms = conn.execute('SELECT start_timestamp FROM EkaRT_Header LIMIT 1').fetchone()[0]
@@ -633,13 +674,36 @@ def convert_db(
             continue
         url, ser = urls[url_id]
         topic = (topic_prefix + _sanitize_topic(url)).replace('//', '/')
-        if only_topics is not None and _normalize_topic_key(topic) not in only_topics:
+        nt = _normalize_topic_key(topic)
+
+        exp_ros: Optional[str] = None
+        if topic_specs is not None:
+            spec = topic_specs.get(nt)
+            if spec is None:
+                continue
+            exp_eka, exp_ros = spec
+            if ser != exp_eka:
+                print(
+                    f'[skip] topic {topic!r}: config eka_type {exp_eka!r} != db ser {ser!r}',
+                    file=sys.stderr,
+                )
+                continue
+        if only_topics is not None and nt not in only_topics:
             continue
+
         ts_ns = _row_timestamp_ns(int(start_ms), int(elapsed))
         blob = data
 
         if ser == 'eka::rt::msg::PointCloud':
-            ensure_topic(topic, 'sensor_msgs/msg/PointCloud2')
+            ros_t = exp_ros or 'sensor_msgs/msg/PointCloud2'
+            if ros_t != 'sensor_msgs/msg/PointCloud2':
+                print(
+                    f'[skip] topic {topic!r}: eka PointCloud maps to '
+                    f'sensor_msgs/msg/PointCloud2, config has {ros_t!r}',
+                    file=sys.stderr,
+                )
+                continue
+            ensure_topic(topic, ros_t)
             fid = _frame_id_from_url(url)
             pc2 = _eka_pointcloud_to_pointcloud2(blob, ts_ns, fid)
             if pc2 is not None:
@@ -647,7 +711,15 @@ def convert_db(
             continue
 
         if ser == 'eka::rt::msg::CameraFrame':
-            ensure_topic(topic, 'sensor_msgs/msg/Image')
+            ros_t = exp_ros or 'sensor_msgs/msg/Image'
+            if ros_t != 'sensor_msgs/msg/Image':
+                print(
+                    f'[skip] topic {topic!r}: eka CameraFrame maps to '
+                    f'sensor_msgs/msg/Image, config has {ros_t!r}',
+                    file=sys.stderr,
+                )
+                continue
+            ensure_topic(topic, ros_t)
             cam_proto = _camera_eka_to_proto(pool, blob)
             fid = _frame_id_from_url(url)
             img = _sensor_image_from_camera_proto(
@@ -677,7 +749,16 @@ def convert_db(
             print(f'[skip] parse {topic} {fqn}: {exc}', file=sys.stderr)
             continue
 
-        ensure_topic(topic, _ros_msg_type_string(ros_cls))
+        ros_t_computed = _ros_msg_type_string(ros_cls)
+        ros_t = exp_ros or ros_t_computed
+        if ros_t != ros_t_computed:
+            print(
+                f'[skip] topic {topic!r}: config ros_type {ros_t!r} != '
+                f'expected {ros_t_computed!r} for {fqn}',
+                file=sys.stderr,
+            )
+            continue
+        ensure_topic(topic, ros_t)
         ros_msg = ros_cls()
         gpal_conversions.convert(proto_msg, ros_msg)
         writer.write(topic, serialize_message(ros_msg), ts_ns)
@@ -715,10 +796,24 @@ def main() -> int:
         help=(
             'Only write messages for this ROS topic (repeat flag for several). '
             'Names must match db2bag output, e.g. /ekart/shm/hal/compressed/cam_fcf_depth_5. '
-            'CameraFrame rows become sensor_msgs/msg/Image (bgr8) with timestamps from the DB.'
+            'CameraFrame rows become sensor_msgs/msg/Image (bgr8) with timestamps from the DB. '
+            'With --config, narrows the YAML list to this topic (repeatable).'
+        ),
+    )
+    p.add_argument(
+        '--config',
+        metavar='YAML',
+        help=(
+            'YAML file (topic, eka_type, ros_type per entry under key "topics"). '
+            'Only listed topics are written; eka_type must match EkaRT_Urls.ser, '
+            'ros_type must match what db2bag emits for that type.'
         ),
     )
     args = p.parse_args()
+
+    topic_specs: Optional[Dict[str, Tuple[str, str]]] = None
+    if args.config:
+        topic_specs = _load_db2bag_topic_config(args.config)
 
     only_set: Optional[FrozenSet[str]] = None
     if args.only_topics:
@@ -732,6 +827,7 @@ def main() -> int:
         pool,
         topic_prefix=args.topic_prefix,
         only_topics=only_set,
+        topic_specs=topic_specs,
     )
     print(f'Wrote bag at {args.bag!r} ({args.storage})')
     return 0

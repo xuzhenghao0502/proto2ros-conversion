@@ -1,0 +1,37 @@
+# Topics to export from an EkaRT SQLite (.db) with db2bag --config.
+# Each entry: output topic name (after db2bag URL sanitization, and with any --topic-prefix),
+# eka_type as stored in EkaRT_Urls.ser, and the ROS 2 type string written to the bag.
+#
+# Usage:
+#   ros2 run gpal_proto_bridge db2bag recording.db out_bag \
+#     --config $(ros2 pkg prefix gpal_proto_bridge)/share/gpal_proto_bridge/config/db2bag_topics.yaml
+
+topics:
+  - topic: /ekart/shm/hal/compressed/cam_bcb_depth_5
+    eka_type: eka::rt::msg::CameraFrame
+    ros_type: sensor_msgs/msg/Image
+
+  - topic: /ekart/shm/hal/compressed/cam_fcf_depth_5
+    eka_type: eka::rt::msg::CameraFrame
+    ros_type: sensor_msgs/msg/Image
+  
+  - topic: /ekart/shm/hal/compressed/cam_fcf_far_depth_5
+    eka_type: eka::rt::msg::CameraFrame
+    ros_type: sensor_msgs/msg/Image
+
+  - topic: /ekart/shm/hal/compressed/cam_flb_depth_5
+    eka_type: eka::rt::msg::CameraFrame
+    ros_type: sensor_msgs/msg/Image
+
+  - topic: /ekart/shm/hal/compressed/cam_flf_depth_5
+    eka_type: eka::rt::msg::CameraFrame
+    ros_type: sensor_msgs/msg/Image 
+
+  - topic: /ekart/shm/hal/compressed/cam_frb_depth_5
+    eka_type: eka::rt::msg::CameraFrame
+    ros_type: sensor_msgs/msg/Image
+
+  - topic: /ekart/shm/hal/compressed/cam_frf_depth_5
+    eka_type: eka::rt::msg::CameraFrame
+    ros_type: sensor_msgs/msg/Image
+

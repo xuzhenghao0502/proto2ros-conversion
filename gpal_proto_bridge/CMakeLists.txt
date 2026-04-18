@@ -145,6 +145,8 @@ rosidl_generated_python_package_add(
 
 install(FILES ${GPAL_CLOSURE_DESC} DESTINATION share/${PROJECT_NAME} RENAME gpal_proto_bridge_messages_gen.desc)
 
+install(FILES config/db2bag_topics.yaml DESTINATION share/${PROJECT_NAME}/config)
+
 # protoc --python_out tree (map_server/, hal/, …) must be on sys.path for generated conversions.py imports.
 install(DIRECTORY "${PROTO_PYTHON_OUT}/" DESTINATION share/${PROJECT_NAME}/pb2_py)
 
