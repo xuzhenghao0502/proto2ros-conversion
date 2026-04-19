@@ -147,13 +147,17 @@ install(FILES ${GPAL_CLOSURE_DESC} DESTINATION share/${PROJECT_NAME} RENAME gpal
 
 install(FILES config/db2bag_topics.yaml DESTINATION share/${PROJECT_NAME}/config)
 
+install(FILES ekart_zerocopy_pointcloud.py DESTINATION lib/${PROJECT_NAME})
+
 # protoc --python_out tree (map_server/, hal/, …) must be on sys.path for generated conversions.py imports.
 install(DIRECTORY "${PROTO_PYTHON_OUT}/" DESTINATION share/${PROJECT_NAME}/pb2_py)
 
 install(PROGRAMS
   scripts/db2bag
   scripts/bag_image_midframe
+  scripts/bag_peek_pointcloud2
   scripts/db_peek_camera_frame
+  scripts/db_peek_pointcloud_zerocopy
   DESTINATION lib/${PROJECT_NAME}
 )
 

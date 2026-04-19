@@ -18,6 +18,11 @@ import sqlite3
 import struct
 import subprocess
 import sys
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+import ekart_zerocopy_pointcloud as _ezpc  # noqa: E402
 from io import BytesIO
 from typing import Dict, FrozenSet, Optional, Tuple, Type
 
@@ -26,7 +31,7 @@ import rosbag2_py
 from ament_index_python.packages import get_package_share_directory
 from builtin_interfaces.msg import Time
 from rclpy.serialization import serialize_message
-from sensor_msgs.msg import Image, PointCloud2, PointField
+from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Header
 
 # Generated conversions.py imports e.g. `map_server.foo_pb2`; those modules live under share/.../pb2_py.
@@ -131,71 +136,28 @@ def _header(stamp_ns: int, frame_id: str) -> Header:
     return h
 
 
-# EkaRT zerocopy lidar: ASCII field list + metadata + N × (3×float32 xyz + 2×int32); optional4-byte trailer.
-_PC_LAYOUT_MARK = b'x,y,z,intensity,timestamp_offset,ring\x00'
+# --- EkaRT URL serializer strings (EkaRT_Urls.ser) → how we interpret each row blob ---
+EKA_SER_CAMERA_FRAME = 'eka::rt::msg::CameraFrame'
+EKA_SER_POINT_CLOUD = _ezpc.EKA_SER_POINT_CLOUD
+
+
+def _classify_eka_ser(ser: str) -> str:
+    """Return a short label for logging / dispatch; matches DB ``ser`` column."""
+    if ser == EKA_SER_CAMERA_FRAME:
+        return 'camera_frame'
+    if ser == EKA_SER_POINT_CLOUD:
+        return 'point_cloud'
+    if ser.startswith('gpal.proto.'):
+        return 'gpal_proto'
+    return 'unknown'
 
 
 def _eka_pointcloud_to_pointcloud2(blob: bytes, stamp_ns: int, frame_id: str) -> Optional[PointCloud2]:
-    idx = blob.find(_PC_LAYOUT_MARK)
-    if idx < 0:
-        print('[warn] PointCloud: missing GPAL layout marker; skip frame', file=sys.stderr)
+    """GPAL zerocopy ``eka::rt::msg::PointCloud`` → ``sensor_msgs/PointCloud2`` (via ``ekart_zerocopy_pointcloud``)."""
+    parsed = _ezpc.parse_zerocopy_pointcloud_blob(blob)
+    if parsed is None:
         return None
-    p = idx + len(_PC_LAYOUT_MARK)
-    while p < len(blob) and blob[p] == 0:
-        p += 1
-    meta_base = p
-    if meta_base + 48 > len(blob):
-        print('[warn] PointCloud: metadata truncated', file=sys.stderr)
-        return None
-    count = struct.unpack_from('<I', blob, meta_base + 24)[0]
-    data_start = meta_base + 48
-    payload_len = len(blob) - data_start
-    ok = False
-    for tail in (4, 0, 8):
-        if payload_len == count * 20 + tail:
-            ok = True
-            break
-    if not ok:
-        for tail in (4, 0, 8):
-            rem = payload_len - tail
-            if rem > 0 and rem % 20 == 0:
-                count = rem // 20
-                ok = True
-                break
-    if not ok or count <= 0:
-        print('[warn] PointCloud: size / count mismatch', file=sys.stderr)
-        return None
-    raw = blob[data_start : data_start + count * 20]
-    dt = np.dtype(
-        [
-            ('x', '<f4'),
-            ('y', '<f4'),
-            ('z', '<f4'),
-            ('_i1', '<i4'),
-            ('_i2', '<i4'),
-        ]
-    )
-    arr = np.frombuffer(raw, dtype=dt, count=count)
-    xyz = np.empty((count, 3), dtype=np.float32)
-    xyz[:, 0] = arr['x']
-    xyz[:, 1] = arr['y']
-    xyz[:, 2] = arr['z']
-
-    pc = PointCloud2()
-    pc.header = _header(stamp_ns, frame_id)
-    pc.height = 1
-    pc.width = int(count)
-    pc.is_dense = False
-    pc.is_bigendian = False
-    pc.fields = [
-        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-    ]
-    pc.point_step = 12
-    pc.row_step = 12 * int(count)
-    pc.data = xyz.astype(np.float32).tobytes()
-    return pc
+    return _ezpc.pointcloud2_from_parsed(parsed, _header(stamp_ns, frame_id))
 
 
 def _decode_jpeg_to_bgr(data: bytes) -> Optional[np.ndarray]:
@@ -553,9 +515,9 @@ def _camera_eka_to_proto(pool: DescriptorPool, blob: bytes):
 def _proto_fqn_for_url_ser(ser: str) -> Optional[str]:
     if ser.startswith('gpal.proto.'):
         return ser
-    if ser == 'eka::rt::msg::CameraFrame':
+    if ser == EKA_SER_CAMERA_FRAME:
         return 'gpal.proto.CameraFrame'
-    if ser == 'eka::rt::msg::PointCloud':
+    if ser == EKA_SER_POINT_CLOUD:
         return None
     return None
 
@@ -694,7 +656,9 @@ def convert_db(
         ts_ns = _row_timestamp_ns(int(start_ms), int(elapsed))
         blob = data
 
-        if ser == 'eka::rt::msg::PointCloud':
+        row_kind = _classify_eka_ser(ser)
+
+        if row_kind == 'point_cloud':
             ros_t = exp_ros or 'sensor_msgs/msg/PointCloud2'
             if ros_t != 'sensor_msgs/msg/PointCloud2':
                 print(
@@ -704,13 +668,13 @@ def convert_db(
                 )
                 continue
             ensure_topic(topic, ros_t)
-            fid = _frame_id_from_url(url)
-            pc2 = _eka_pointcloud_to_pointcloud2(blob, ts_ns, fid)
+            # Lidar point clouds use a fixed frame for downstream fusion / TF trees.
+            pc2 = _eka_pointcloud_to_pointcloud2(blob, ts_ns, 'base_link')
             if pc2 is not None:
                 writer.write(topic, serialize_message(pc2), ts_ns)
             continue
 
-        if ser == 'eka::rt::msg::CameraFrame':
+        if row_kind == 'camera_frame':
             ros_t = exp_ros or 'sensor_msgs/msg/Image'
             if ros_t != 'sensor_msgs/msg/Image':
                 print(
@@ -727,6 +691,13 @@ def convert_db(
             )
             if img is not None:
                 writer.write(topic, serialize_message(img), ts_ns)
+            continue
+
+        if row_kind != 'gpal_proto':
+            print(
+                f'[skip] Unsupported ser={ser!r} (kind={row_kind!r}) topic={topic}',
+                file=sys.stderr,
+            )
             continue
 
         fqn = _proto_fqn_for_url_ser(ser)

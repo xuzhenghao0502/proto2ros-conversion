@@ -37,7 +37,9 @@
 
 ### `db2bag`
 
-将整份 EkaRT `.db` 转为 rosbag2 目录（默认存储后端 `sqlite3`）。`CameraFrame` 行会变为 `sensor_msgs/msg/Image`，`encoding` 为 **`bgr8`**（按 OpenCV 常用的 **BGR** 布局解码）；时间戳使用 **`EkaRT_Header.start_timestamp`** 与每行的 **`elapsed`**。
+将整份 EkaRT `.db` 转为 rosbag2 目录（默认存储后端 `sqlite3`）。`CameraFrame` 行会变为 `sensor_msgs/msg/Image`，`encoding` 为 **`bgr8`**（按 OpenCV 常用的 **BGR** 布局解码）；`eka::rt::msg::PointCloud`（GPAL zerocopy 布局）会变为 **`sensor_msgs/msg/PointCloud2`**。时间戳使用 **`EkaRT_Header.start_timestamp`** 与每行的 **`elapsed`**。
+
+包内示例配置 [`gpal_proto_bridge/config/db2bag_topics.yaml`](gpal_proto_bridge/config/db2bag_topics.yaml) 已列出 **7 路压缩相机**（`CameraFrame` → `sensor_msgs/msg/Image`）与 **1 路前向激光点云**（`PointCloud` → `sensor_msgs/msg/PointCloud2`）。在录制库中确实存在对应 `EkaRT_Urls` 通道的前提下，执行 `db2bag ... --config` 指向该文件，即可将上述 **8 路数据写入同一个 rosbag2**；库中未出现的 topic 会被自然跳过，已出现且类型匹配的 topic 会按时间顺序交织写入。
 
 | 用途 | 命令 |
 |------|------|
@@ -46,7 +48,7 @@
 | 仅导出指定 topic | `ros2 run gpal_proto_bridge db2bag recording.db out_bag_dir --only-topic /ekart/shm/hal/compressed/fisheye_fcf_depth_5`（可多次写 `--only-topic`）。topic 名须与 `db_peek_camera_frame --list` 中的规范化名称一致。若在 `db2bag` 上使用了 `--topic-prefix`，则每个 `--only-topic` 也要带上该前缀。 |
 | 用 YAML 列出要导出的 topic | `ros2 run gpal_proto_bridge db2bag recording.db out_bag_dir --config path/to/db2bag_topics.yaml`。配置中每条需包含 **`topic`**（输出 topic 名）、**`eka_type`**（与 `EkaRT_Urls.ser` 一致，如 `eka::rt::msg::CameraFrame`）、**`ros_type`**（写入 bag 的 ROS 2 类型，如 `sensor_msgs/msg/Image`）。**仅**列表中的 topic 会写入；脚本会校验库里的 `ser` 与 `eka_type` 一致，且 `ros_type` 与 `db2bag` 对该类型的实际输出一致（例如 `CameraFrame` 必须对应 `sensor_msgs/msg/Image`，`PointCloud` 必须对应 `sensor_msgs/msg/PointCloud2`，`gpal.proto.*` 则对应 `gpal_proto_bridge/msg/<消息名>`）。 |
 
-**配置文件：**源码见 [`gpal_proto_bridge/config/db2bag_topics.yaml`](gpal_proto_bridge/config/db2bag_topics.yaml)；安装后为 `$(ros2 pkg prefix gpal_proto_bridge)/share/gpal_proto_bridge/config/db2bag_topics.yaml`。可复制后自行增删条目，再通过 `--config` 指向你的文件。使用 `--config` 需要 **`python3-yaml`**（见下文依赖表）。
+**配置文件：**源码见 [`gpal_proto_bridge/config/db2bag_topics.yaml`](gpal_proto_bridge/config/db2bag_topics.yaml)；安装后为 `$(ros2 pkg prefix gpal_proto_bridge)/share/gpal_proto_bridge/config/db2bag_topics.yaml`。可复制后自行增删条目，再通过 `--config` 指向你的文件。使用 `--config` 需要 **`python3-yaml`**（`gpal_proto_bridge` 的 `package.xml` 已声明 `exec_depend`，见下文依赖表）。
 
 **`--config` 与 `--only-topic`：** 可同时使用——先按 YAML 限定允许导出的 topic，再与命令行上的 `--only-topic` 求交集。
 
@@ -59,7 +61,7 @@ ros2 run gpal_proto_bridge db_peek_camera_frame data/C2_0328.db \
 ros2 run gpal_proto_bridge db2bag data/C2_0328.db data/export_bag \
   --only-topic /ekart/shm/hal/compressed/cam_fcf_depth_5
 
-# 使用包内示例 topic 列表（安装后）
+# 使用包内示例 topic 列表（7×Image + 1×PointCloud2，安装后）
 CFG="$(ros2 pkg prefix gpal_proto_bridge)/share/gpal_proto_bridge/config/db2bag_topics.yaml"
 ros2 run gpal_proto_bridge db2bag data/C2_0328.db data/export_bag_config --config "$CFG"
 
@@ -67,6 +69,10 @@ ros2 run gpal_proto_bridge db2bag data/C2_0328.db data/export_bag_config --confi
 ros2 run gpal_proto_bridge db2bag data/C2_0328.db data/export_bag_config \
   --config gpal_proto_bridge/config/db2bag_topics.yaml
 ```
+
+### `db_peek_pointcloud_zerocopy`（可选）
+
+按 ROS topic 从 `.db` 中取 **一帧** `eka::rt::msg::PointCloud` zerocopy 数据，打印元数据与指定下标的 `LiDARPoint` 字段，便于对照 `db2bag` 导出的 `PointCloud2`。默认 topic 与示例 YAML 中的前向雷达一致，可用 `--topic` / `--frame` / `--point-index` 调整。
 
 ## 构建与环境依赖（Python）
 

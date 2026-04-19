@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+# Copyright 2026 GPAL — parse one EkaRT DB ``eka::rt::msg::PointCloud`` zerocopy row and print key fields.
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sqlite3
+import sys
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+import ekart_zerocopy_pointcloud as ezp  # noqa: E402
+
+
+def _sanitize_topic(url: str) -> str:
+    s = url.replace('://', '/').replace('?', '_').replace('&', '_').replace('=', '_')
+    s = re.sub(r'[^0-9A-Za-z/_-]+', '_', s)
+    s = re.sub(r'_+', '_', s).strip('_')
+    return '/ekart/' + s.lstrip('/')
+
+
+def _resolve_url_id(conn: sqlite3.Connection, topic: str) -> int:
+    want = topic.rstrip('/').replace('//', '/')
+    for uid, url, ser in conn.execute('SELECT id, url, ser FROM EkaRT_Urls').fetchall():
+        if str(ser) != ezp.EKA_SER_POINT_CLOUD:
+            continue
+        if _sanitize_topic(str(url)) == want:
+            return int(uid)
+    raise SystemExit(
+        f'No {ezp.EKA_SER_POINT_CLOUD!r} URL maps to topic {want!r} (see EkaRT_Urls).'
+    )
+
+
+def _print_parsed_summary(parsed: ezp.ZerocopyPointcloudParsed, elapsed: int) -> None:
+    mark_end = parsed.marker_offset + len(parsed.layout_ascii) + 1
+    print(f'frame elapsed_us (DB row): {elapsed}')
+    print(f'blob_total_len: {parsed.blob_total_len}')
+    print(f'layout_ascii: {parsed.layout_ascii!r}')
+    print(f'layout_marker_offset: {parsed.marker_offset} (ASCII+null ends ~{mark_end})')
+    print(f'tail_field_names (after x,y,z): {list(parsed.tail_field_names)}')
+    print(
+        f'point_step: {parsed.point_step} bytes; tail pack (after xyz): '
+        f'{parsed.tail_struct_suffix!r} names={list(parsed.tail_packed_names)}'
+    )
+    print(f'metadata_offset: {parsed.meta_offset} (48 bytes = 12×uint32 LE)')
+    print(f'meta_u32[0..11]: {list(parsed.meta_u32)}')
+    print(f'point_count (header u32[6], offset +24): {parsed.point_count_header}')
+    print(f'point_count_effective: {parsed.point_count_effective}')
+    print(f'data_start: {parsed.data_start}')
+    print(f'tail_pad_bytes (after points): {parsed.tail_pad_bytes}')
+    exp = parsed.point_count_effective * parsed.point_step
+    print(f'raw_point_block_len: {len(parsed.raw_point_block)} (expected {exp})')
+
+
+def _print_lidar_point(title: str, pt: ezp.LiDARPoint | None) -> None:
+    print(title)
+    if pt is None:
+        print('  (missing — index out of range for this frame)')
+        return
+    for line in pt.describe_lines():
+        print(line)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=(
+            'Parse one zerocopy PointCloud frame from an EkaRT SQLite DB and print metadata '
+            'plus selected LiDARPoint entries.'
+        ),
+    )
+    p.add_argument('db', help='Path to EkaRT SQLite database')
+    p.add_argument(
+        '--topic',
+        default='/ekart/shm/hal/point_zerocopy/lidar_center_front_depth_10',
+        help='ROS-style topic from db2bag sanitization',
+    )
+    p.add_argument(
+        '--frame',
+        type=int,
+        default=10,
+        help='1-based frame index (ORDER BY elapsed, rowid), default: 10',
+    )
+    p.add_argument(
+        '--point-index',
+        type=int,
+        action='append',
+        dest='point_indices',
+        metavar='I',
+        help='0-based point index to print (repeatable; default: 0 and 10)',
+    )
+    args = p.parse_args()
+
+    db_path = os.path.abspath(args.db)
+    if not os.path.isfile(db_path):
+        print(f'Missing database: {db_path}', file=sys.stderr)
+        return 1
+
+    if args.frame < 1:
+        print('--frame must be >= 1 (1-based)', file=sys.stderr)
+        return 1
+
+    indices = args.point_indices if args.point_indices else [0, 10]
+
+    conn = sqlite3.connect(db_path)
+    url_id = _resolve_url_id(conn, args.topic)
+    off = args.frame - 1
+    row = conn.execute(
+        'SELECT elapsed, data FROM EkaRT_Datas WHERE url = ? ORDER BY elapsed, rowid LIMIT 1 OFFSET ?',
+        (url_id, off),
+    ).fetchone()
+    conn.close()
+
+    if row is None:
+        print(
+            f'No row at frame {args.frame} (offset {off}) for url id {url_id} / topic {args.topic!r}',
+            file=sys.stderr,
+        )
+        return 1
+
+    elapsed, blob = row
+    parsed = ezp.parse_zerocopy_pointcloud_blob(blob)
+    if parsed is None:
+        return 1
+
+    print(f'topic: {args.topic!r}')
+    print(f'url_id: {url_id}')
+    print()
+    _print_parsed_summary(parsed, int(elapsed))
+    print()
+    pts = parsed.lidar_points()
+    print(f'points list length: {len(pts)}')
+    print()
+    for i in indices:
+        _print_lidar_point(f'LiDARPoint index {i}:', parsed.lidar_point_at(i))
+        print()
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

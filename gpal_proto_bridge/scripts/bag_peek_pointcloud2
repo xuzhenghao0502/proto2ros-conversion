@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+# Copyright 2026 GPAL — rosbag2 helper: print one PointCloud2 message and selected point fields.
+
+from __future__ import annotations
+
+import argparse
+import os
+import struct
+import sys
+from typing import Any, List, Tuple
+
+import rclpy
+import rosbag2_py
+from rclpy.serialization import deserialize_message
+from sensor_msgs.msg import PointCloud2, PointField
+
+
+def normalize_topic(topic: str) -> str:
+    t = topic.strip()
+    if not t.startswith('/'):
+        t = '/' + t
+    return t
+
+
+def resolve_bag_uri(path: str) -> str:
+    """If ``path`` points at ``*.db3``, use its parent directory (rosbag2 metadata lives there)."""
+    ap = os.path.abspath(path)
+    if os.path.isfile(ap) and ap.endswith('.db3'):
+        return os.path.dirname(ap)
+    return ap
+
+
+def open_reader(bag_uri: str, storage_id: str) -> rosbag2_py.SequentialReader:
+    reader = rosbag2_py.SequentialReader()
+    reader.open(
+        rosbag2_py.StorageOptions(uri=bag_uri, storage_id=storage_id),
+        rosbag2_py.ConverterOptions(
+            input_serialization_format='cdr',
+            output_serialization_format='cdr',
+        ),
+    )
+    return reader
+
+
+def read_pointcloud_at_index(
+    bag_uri: str,
+    storage_id: str,
+    topic: str,
+    index_0based: int,
+) -> PointCloud2:
+    reader = open_reader(bag_uri, storage_id)
+    seen = 0
+    while reader.has_next():
+        tname, data, _ts = reader.read_next()
+        if normalize_topic(tname) != topic:
+            continue
+        if seen == index_0based:
+            return deserialize_message(data, PointCloud2)
+        seen += 1
+    raise RuntimeError(
+        f'bag ended before message index {index_0based} on {topic} (saw {seen} messages)'
+    )
+
+
+def _datatype_fmt(dt: int) -> str:
+    if dt == PointField.INT8:
+        return 'b'
+    if dt == PointField.UINT8:
+        return 'B'
+    if dt == PointField.INT16:
+        return 'h'
+    if dt == PointField.UINT16:
+        return 'H'
+    if dt == PointField.INT32:
+        return 'i'
+    if dt == PointField.UINT32:
+        return 'I'
+    if dt == PointField.FLOAT32:
+        return 'f'
+    if dt == PointField.FLOAT64:
+        return 'd'
+    raise ValueError(f'unsupported PointField.datatype {dt}')
+
+
+def _datatype_size(dt: int) -> int:
+    return struct.calcsize(_datatype_fmt(dt))
+
+
+def pointcloud_num_points(msg: PointCloud2) -> int:
+    return int(msg.width) * int(msg.height) if msg.height > 0 else int(msg.width)
+
+
+def extract_point_fields(msg: PointCloud2, point_index: int) -> List[Tuple[str, List[Any]]]:
+    n = pointcloud_num_points(msg)
+    if point_index < 0 or point_index >= n:
+        raise IndexError(f'point_index {point_index} out of range [0, {n})')
+    base = point_index * int(msg.point_step)
+    step = int(msg.point_step)
+    if base + step > len(msg.data):
+        raise IndexError('point slice exceeds msg.data length')
+    row = memoryview(msg.data)[base : base + step]
+    big = bool(msg.is_bigendian)
+    prefix = '>' if big else '<'
+    out: List[Tuple[str, List[Any]]] = []
+    for f in sorted(msg.fields, key=lambda x: x.offset):
+        fmt = _datatype_fmt(f.datatype)
+        el = struct.calcsize(prefix + fmt)
+        vals: List[Any] = []
+        for c in range(int(f.count)):
+            off = int(f.offset) + c * el
+            vals.append(struct.unpack_from(prefix + fmt, row, off)[0])
+        out.append((f.name, vals))
+    return out
+
+
+def format_pointcloud_header(msg: PointCloud2) -> str:
+    h = msg.header
+    lines = [
+        f'header.stamp: {h.stamp.sec}.{h.stamp.nanosec:09d}',
+        f'header.frame_id: {h.frame_id!r}',
+        f'height: {msg.height}  width: {msg.width}  points: {pointcloud_num_points(msg)}',
+        f'is_bigendian: {msg.is_bigendian}  is_dense: {msg.is_dense}',
+        f'point_step: {msg.point_step}  row_step: {msg.row_step}  data_len: {len(msg.data)}',
+        'fields:',
+    ]
+    for f in msg.fields:
+        lines.append(
+            f'  - {f.name!r} offset={f.offset} datatype={f.datatype} count={f.count}'
+        )
+    return '\n'.join(lines)
+
+
+def format_point_detail(title: str, msg: PointCloud2, point_index: int) -> str:
+    lines = [title]
+    try:
+        pairs = extract_point_fields(msg, point_index)
+    except IndexError as exc:
+        lines.append(f'  (cannot read point: {exc})')
+        return '\n'.join(lines)
+    for name, vals in pairs:
+        if len(vals) == 1:
+            lines.append(f'  {name}: {vals[0]!r}')
+        else:
+            lines.append(f'  {name}: {vals!r}')
+    return '\n'.join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=(
+            'Read a rosbag2 bag, take the N-th PointCloud2 on a topic (1-based frame), '
+            'and print cloud header plus point data at given 0-based indices.'
+        ),
+    )
+    p.add_argument(
+        'bag',
+        nargs='?',
+        default='data/output_bag/output_bag_0.db3',
+        help='Bag directory, or path to *.db3 (parent dir is used); default: data/output_bag/output_bag_0.db3',
+    )
+    p.add_argument(
+        '--topic',
+        default='/ekart/shm/hal/point_zerocopy/lidar_center_front_depth_10',
+        help='PointCloud2 topic name',
+    )
+    p.add_argument(
+        '--frame',
+        type=int,
+        default=10,
+        help='1-based index among messages on this topic (default: 10)',
+    )
+    p.add_argument(
+        '--point-index',
+        type=int,
+        action='append',
+        dest='point_indices',
+        metavar='I',
+        help='0-based point index to print (repeatable; default: 0 and 10)',
+    )
+    p.add_argument(
+        '--storage-id',
+        default='',
+        help='rosbag2 storage plugin id (default: empty for automatic)',
+    )
+    args = p.parse_args()
+
+    if args.frame < 1:
+        print('--frame must be >= 1', file=sys.stderr)
+        return 2
+
+    topic = normalize_topic(args.topic)
+    bag_uri = resolve_bag_uri(args.bag)
+    if not os.path.exists(bag_uri):
+        print(f'bag path does not exist: {bag_uri!r}', file=sys.stderr)
+        return 2
+
+    indices = args.point_indices if args.point_indices else [0, 10]
+    frame_0 = args.frame - 1
+
+    rclpy.init(args=sys.argv)
+    try:
+        try:
+            pc = read_pointcloud_at_index(bag_uri, args.storage_id, topic, frame_0)
+        except RuntimeError as exc:
+            print(f'error: {exc}', file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f'error: failed to read/deserialize PointCloud2: {exc}', file=sys.stderr)
+            return 3
+
+        print(f'bag_uri: {bag_uri!r}')
+        print(f'topic: {topic!r}')
+        print(f'frame: {args.frame} (0-based message index {frame_0})')
+        print()
+        print(format_pointcloud_header(pc))
+        print()
+        for pi in indices:
+            print(format_point_detail(f'Point index {pi} (0-based):', pc, pi))
+            print()
+        return 0
+    finally:
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

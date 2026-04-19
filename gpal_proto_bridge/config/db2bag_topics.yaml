@@ -35,3 +35,7 @@ topics:
     eka_type: eka::rt::msg::CameraFrame
     ros_type: sensor_msgs/msg/Image
 
+  - topic: /ekart/shm/hal/point_zerocopy/lidar_center_front_depth_10
+    eka_type: eka::rt::msg::PointCloud
+    ros_type: sensor_msgs/msg/PointCloud2
+
